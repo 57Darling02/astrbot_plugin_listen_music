@@ -2,6 +2,7 @@ name: astrbot_plugin_listen_music
 display_name: 我想听歌！
 desc: Bilibili 单源搜索、语音听歌与文件下载。
 short_desc: 我想听歌！用 Bilibili 找歌并发送可播放音频。
-version: v0.1.2
+version: 0.1.3
 astrbot_version: ">=4.26,<5"
 author: 57Darling02
+repo: https://github.com/57Darling02/astrbot_plugin_listen_music

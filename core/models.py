@@ -24,8 +24,6 @@ class BilibiliCandidate:
     search endpoint, which can contain useful wording not present in the
     video-detail title. ``uploader`` intentionally remains named as such:
     Bilibili does not reliably expose the recording artist in its video API.
-    ``category`` preserves Bilibili's search ``typename`` solely for narrow
-    negative filtering; it does not affect result ordering or display.
     """
 
     bvid: str
@@ -34,7 +32,6 @@ class BilibiliCandidate:
     uploader: str
     duration_ms: int
     page_title: str = ""
-    category: str = ""
     search_title: str = ""
 
     def __post_init__(self) -> None:
@@ -42,7 +39,6 @@ class BilibiliCandidate:
         title = self.title.strip()
         uploader = self.uploader.strip()
         page_title = self.page_title.strip()
-        category = self.category.strip()
         search_title = self.search_title.strip() or title
 
         if not bvid:
@@ -58,7 +54,6 @@ class BilibiliCandidate:
         object.__setattr__(self, "title", title)
         object.__setattr__(self, "uploader", uploader)
         object.__setattr__(self, "page_title", page_title)
-        object.__setattr__(self, "category", category)
         object.__setattr__(self, "search_title", search_title)
 
     @property
@@ -66,18 +61,6 @@ class BilibiliCandidate:
         """Opaque, stable identifier used inside short-lived search snapshots."""
 
         return f"{self.bvid}:{self.cid}"
-
-    @property
-    def match_text(self) -> str:
-        """Search, video, and page titles used together by safety filters."""
-
-        return " ".join(
-            dict.fromkeys(
-                part
-                for part in (self.search_title, self.title, self.page_title)
-                if part
-            )
-        )
 
     @property
     def display_title(self) -> str:

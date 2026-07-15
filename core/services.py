@@ -15,6 +15,7 @@ import re
 from typing import Any, Protocol
 import unicodedata
 
+from .bilibili import BilibiliVideoRef
 from .matcher import filter_bilibili_candidates, prepare_bilibili_search_query
 from .media import FfmpegUnavailableError, MAX_MEDIA_DURATION_MS, MediaError, MediaStore
 from .models import BilibiliCandidate, LocalMedia, SearchSnapshot
@@ -66,11 +67,13 @@ class _BilibiliClient(Protocol):
 
     async def get_video(self, bvid: str) -> Any: ...
 
+    async def get_video_by_aid(self, aid: int) -> Any: ...
+
     async def resolve_audio(self, bvid: str, cid: int) -> Any: ...
 
 
 class SearchService:
-    """Search Bilibili videos, expand pages, then filter direct or manual results."""
+    """Search Bilibili videos, expand pages, then retain deliverable results."""
 
     def __init__(
         self,
@@ -86,31 +89,40 @@ class SearchService:
         session_id: str,
         query: str,
         song_title: str | None = None,
-        exclude_alternative_versions: bool = False,
+        video_ref: BilibiliVideoRef | None = None,
     ) -> SearchSnapshot:
         """Search Bilibili and retain a session-bound candidate set.
 
         The source keyword is the cleaned user request and never receives an
-        invented version label. ``exclude_alternative_versions`` only affects
-        local filtering: it rejects clearly labelled Live, cover, Remix,
-        instrumental, altered, and edit variants unless the query explicitly
-        requests one. It does not assert that an unlabelled result is the
-        canonical recording.
+        invented version label. Candidate labels remain available for the
+        LLM's contextual choice; local filtering only enforces delivery facts.
 
         ``song_title`` is optional because command searches receive a free-form
-        keyword. When supplied by the structured LLM request, it is used only
-        to identify pages within a multi-page video. The broader source query
-        must never choose a page: it can contain artist and version terms.
+        keyword. When supplied by the structured LLM request, it identifies
+        pages within multi-page videos and can provide one narrower recall
+        pass when the complete query returns fewer than ten results.
+
+        ``video_ref`` is an exact video-level reference parsed from user input.
+        It bypasses keyword recall but still expands to page-level candidates,
+        so a download can never skip the normal snapshot and user selection.
         """
 
         if not session_id.strip():
             raise ValueError("session_id must not be blank")
 
-        requested_query, candidates = await self._filtered_candidates(
-            query,
-            song_title=song_title,
-            exclude_alternative_versions=exclude_alternative_versions,
-        )
+        if video_ref is None:
+            requested_query, candidates = await self._filtered_candidates(
+                query,
+                song_title=song_title,
+            )
+        else:
+            requested_query = _video_ref_label(video_ref)
+            candidates = filter_bilibili_candidates(
+                await self._reference_candidates(video_ref),
+                limit=SEARCH_LIMIT,
+            )
+            if not candidates:
+                raise MusicSearchError("指定的 Bilibili 视频没有可播放的音频")
         return self._snapshots.create(
             session_id=session_id,
             query=requested_query,
@@ -122,7 +134,6 @@ class SearchService:
         query: str,
         *,
         song_title: str | None,
-        exclude_alternative_versions: bool,
     ) -> tuple[str, tuple[BilibiliCandidate, ...]]:
         requested_query = _normalize_query(query)
         api_query = prepare_bilibili_search_query(requested_query)
@@ -133,12 +144,23 @@ class SearchService:
             api_query,
             song_title=song_title,
         )
-        filtered = filter_bilibili_candidates(
-            requested_query,
-            candidates,
-            exclude_alternative_versions=exclude_alternative_versions,
-            limit=SEARCH_LIMIT,
-        )
+        filtered = filter_bilibili_candidates(candidates, limit=SEARCH_LIMIT)
+
+        fallback_query = _song_title_fallback_query(song_title, api_query)
+        if len(filtered) < SEARCH_LIMIT and fallback_query is not None:
+            try:
+                fallback_candidates = await self._search_candidates(
+                    fallback_query,
+                    song_title=song_title,
+                )
+            except MusicSearchError:
+                # The second query improves recall only; a source failure must
+                # never discard usable candidates from the primary query.
+                fallback_candidates = ()
+            filtered = _merge_candidates(
+                filtered,
+                fallback_candidates,
+            )
         if not filtered:
             raise MusicSearchError(f"没有找到“{requested_query}”的可播放 Bilibili 音乐")
         return requested_query, filtered
@@ -181,35 +203,36 @@ class SearchService:
         for search_hit, video in zip(videos, detailed):
             if video is None:
                 continue
-            bvid = str(getattr(video, "bvid", "")).strip()
-            title = str(getattr(video, "title", "")).strip()
-            uploader = str(getattr(video, "uploader", "")).strip()
-            if not bvid or not title:
-                continue
-            pages = _select_pages(getattr(video, "pages", ()), song_title)
-            for page in pages:
-                cid = _positive_int(getattr(page, "cid", 0))
-                duration_ms = _nonnegative_int(getattr(page, "duration_ms", 0))
-                if not cid or duration_ms > MAX_MEDIA_DURATION_MS:
-                    continue
-                try:
-                    candidates.append(
-                        BilibiliCandidate(
-                            bvid=bvid,
-                            cid=cid,
-                            title=title,
-                            page_title=str(getattr(page, "title", "")).strip(),
-                            uploader=uploader,
-                            duration_ms=duration_ms,
-                            category=str(getattr(search_hit, "category", "")).strip(),
-                            search_title=str(getattr(search_hit, "title", "")).strip(),
-                        )
-                    )
-                except ValueError:
-                    continue
-                if len(candidates) >= BILIBILI_PAGE_LIMIT:
-                    return tuple(candidates)
+            candidates.extend(
+                _expand_video_candidates(
+                    video,
+                    search_title=str(getattr(search_hit, "title", "")).strip(),
+                    song_title=song_title,
+                )
+            )
+            if len(candidates) >= BILIBILI_PAGE_LIMIT:
+                return tuple(candidates[:BILIBILI_PAGE_LIMIT])
         return tuple(candidates)
+
+    async def _reference_candidates(
+        self, video_ref: BilibiliVideoRef
+    ) -> tuple[BilibiliCandidate, ...]:
+        """Resolve one user-provided video reference without keyword fallback."""
+
+        try:
+            if video_ref.bvid is not None:
+                video = await self._bilibili.get_video(video_ref.bvid)
+            else:
+                assert video_ref.aid is not None
+                video = await self._bilibili.get_video_by_aid(video_ref.aid)
+        except Exception as exc:
+            raise MusicSearchError("无法打开指定的 Bilibili 视频") from exc
+        return _expand_video_candidates(
+            video,
+            search_title=str(getattr(video, "title", "")).strip(),
+            song_title=None,
+            include_all_pages=True,
+        )
 
 
 class DeliveryService:
@@ -284,6 +307,80 @@ def _normalize_query(query: str) -> str:
     if len(normalized) > 120:
         raise MusicSearchError("搜索关键词不能超过 120 个字符")
     return normalized
+
+
+def _video_ref_label(video_ref: BilibiliVideoRef) -> str:
+    """Use the literal reference as the short snapshot label before lookup."""
+
+    return video_ref.bvid or f"av{video_ref.aid}"
+
+
+def _expand_video_candidates(
+    video: Any,
+    *,
+    search_title: str,
+    song_title: str | None,
+    include_all_pages: bool = False,
+) -> tuple[BilibiliCandidate, ...]:
+    """Turn one validated video detail response into bounded page candidates."""
+
+    bvid = str(getattr(video, "bvid", "")).strip()
+    title = str(getattr(video, "title", "")).strip()
+    uploader = str(getattr(video, "uploader", "")).strip()
+    if not bvid or not title:
+        return ()
+
+    pages = tuple(getattr(video, "pages", ()))
+    selected_pages = pages if include_all_pages else _select_pages(pages, song_title)
+    candidates: list[BilibiliCandidate] = []
+    for page in selected_pages:
+        cid = _positive_int(getattr(page, "cid", 0))
+        duration_ms = _nonnegative_int(getattr(page, "duration_ms", 0))
+        if not cid or not 0 < duration_ms <= MAX_MEDIA_DURATION_MS:
+            continue
+        try:
+            candidates.append(
+                BilibiliCandidate(
+                    bvid=bvid,
+                    cid=cid,
+                    title=title,
+                    page_title=str(getattr(page, "title", "")).strip(),
+                    uploader=uploader,
+                    duration_ms=duration_ms,
+                    search_title=search_title,
+                )
+            )
+        except ValueError:
+            continue
+        if len(candidates) >= BILIBILI_PAGE_LIMIT:
+            break
+    return tuple(candidates)
+
+
+def _song_title_fallback_query(
+    song_title: str | None, primary_query: str
+) -> str | None:
+    """Return a narrower valid query only when it differs from the primary one."""
+
+    if not isinstance(song_title, str):
+        return None
+    try:
+        title_query = prepare_bilibili_search_query(_normalize_query(song_title))
+    except MusicSearchError:
+        return None
+    return title_query if title_query and title_query != primary_query else None
+
+
+def _merge_candidates(
+    primary: Sequence[BilibiliCandidate],
+    fallback: Sequence[BilibiliCandidate],
+) -> tuple[BilibiliCandidate, ...]:
+    """Preserve primary ordering while deduplicating a bounded recall fallback."""
+
+    return filter_bilibili_candidates(
+        (*primary, *fallback),
+        limit=SEARCH_LIMIT,
+    )
 
 
 def _display_stem(candidate: BilibiliCandidate) -> str:

@@ -11,6 +11,7 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from core.media import MediaError
+from core.bilibili import BilibiliVideoRef
 from core.models import LocalMedia, ResolvedAudio
 from core.services import (
     SEARCH_LIMIT,
@@ -27,7 +28,6 @@ from core.services import (
 @dataclass(frozen=True)
 class Hit:
     bvid: str
-    category: str = ""
     title: str = ""
 
 
@@ -44,7 +44,6 @@ class Video:
     title: str
     uploader: str
     pages: tuple[Page, ...]
-    category: str = ""
 
 
 class FakeBilibili:
@@ -54,13 +53,17 @@ class FakeBilibili:
         *,
         audio: ResolvedAudio | None = None,
         search_error: Exception | None = None,
+        query_hits: dict[str, tuple[str, ...]] | None = None,
+        query_errors: dict[str, Exception] | None = None,
+        reference_videos: dict[int, Video] | None = None,
+        reference_error: Exception | None = None,
         resolve_error: Exception | None = None,
     ) -> None:
         self._videos = {video.bvid: video for video in videos}
         self._hits = tuple(
-            Hit(video.bvid, video.category, f"搜索结果：{video.title}")
-            for video in videos
+            Hit(video.bvid, f"搜索结果：{video.title}") for video in videos
         )
+        self._hits_by_bvid = {hit.bvid: hit for hit in self._hits}
         self._audio = audio or ResolvedAudio(
             url="https://cdn.example.test/audio.m4s",
             mime_type="audio/mp4",
@@ -68,18 +71,42 @@ class FakeBilibili:
             needs_remux=True,
         )
         self._search_error = search_error
+        self._query_hits = dict(query_hits or {})
+        self._query_errors = dict(query_errors or {})
+        self._reference_videos = dict(reference_videos or {})
+        self._reference_error = reference_error
         self._resolve_error = resolve_error
         self.search_queries: list[str] = []
+        self.video_calls: list[str] = []
+        self.aid_calls: list[int] = []
         self.resolve_calls: list[tuple[str, int]] = []
 
     async def search_videos(self, query: str, *, limit: int = 12):
         self.search_queries.append(query)
         if self._search_error is not None:
             raise self._search_error
-        return self._hits[:limit]
+        error = self._query_errors.get(query)
+        if error is not None:
+            raise error
+        bvids = self._query_hits.get(query)
+        hits = (
+            tuple(self._hits_by_bvid[bvid] for bvid in bvids)
+            if bvids is not None
+            else self._hits
+        )
+        return hits[:limit]
 
     async def get_video(self, bvid: str):
+        self.video_calls.append(bvid)
+        if self._reference_error is not None:
+            raise self._reference_error
         return self._videos[bvid]
+
+    async def get_video_by_aid(self, aid: int):
+        self.aid_calls.append(aid)
+        if self._reference_error is not None:
+            raise self._reference_error
+        return self._reference_videos[aid]
 
     async def resolve_audio(self, bvid: str, cid: int) -> ResolvedAudio:
         self.resolve_calls.append((bvid, cid))
@@ -113,14 +140,12 @@ def video(
     title: str = "周杰伦 - 晴天",
     uploader: str = "周杰伦音乐",
     pages: tuple[Page, ...] = (Page(1, "晴天", 269_000),),
-    category: str = "",
 ) -> Video:
     return Video(
         bvid=bvid,
         title=title,
         uploader=uploader,
         pages=pages,
-        category=category,
     )
 
 
@@ -131,6 +156,10 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         *,
         audio: ResolvedAudio | None = None,
         search_error: Exception | None = None,
+        query_hits: dict[str, tuple[str, ...]] | None = None,
+        query_errors: dict[str, Exception] | None = None,
+        reference_videos: dict[int, Video] | None = None,
+        reference_error: Exception | None = None,
         resolve_error: Exception | None = None,
         media_error: Exception | None = None,
     ) -> tuple[SearchService, DeliveryService, FakeBilibili, FakeMedia]:
@@ -138,6 +167,10 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
             videos,
             audio=audio,
             search_error=search_error,
+            query_hits=query_hits,
+            query_errors=query_errors,
+            reference_videos=reference_videos,
+            reference_error=reference_error,
             resolve_error=resolve_error,
         )
         search = SearchService(bilibili)
@@ -195,19 +228,143 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bilibili.search_queries, ["晴天"])
         self.assertEqual(snapshot.candidates[0].candidate_id, "BV1:1")
 
-    async def test_search_retains_mv_but_discards_an_unrelated_category(self) -> None:
+    async def test_structured_song_title_fills_short_primary_results_once(self) -> None:
+        videos = tuple(video(f"BV{index}") for index in range(1, 12))
+        search, _, bilibili, _ = await self._workflow(
+            videos,
+            query_hits={
+                "晴天 周杰伦": ("BV1", "BV2"),
+                "晴天": tuple(f"BV{index}" for index in range(2, 12)),
+            },
+        )
+
+        snapshot = await search.search(
+            session_id="chat-a",
+            query="晴天 周杰伦",
+            song_title="晴天",
+        )
+
+        self.assertEqual(bilibili.search_queries, ["晴天 周杰伦", "晴天"])
+        self.assertEqual(
+            [candidate.candidate_id for candidate in snapshot.candidates],
+            [f"BV{index}:1" for index in range(1, SEARCH_LIMIT + 1)],
+        )
+
+    async def test_song_title_equal_to_primary_query_does_not_search_twice(
+        self,
+    ) -> None:
+        search, _, bilibili, _ = await self._workflow((video("BV1"),))
+
+        await search.search(
+            session_id="chat-a",
+            query="晴天",
+            song_title="晴天",
+        )
+
+        self.assertEqual(bilibili.search_queries, ["晴天"])
+
+    async def test_failed_song_title_fallback_keeps_primary_results(self) -> None:
+        search, _, bilibili, _ = await self._workflow(
+            (video("BV1"),),
+            query_hits={"晴天 周杰伦": ("BV1",)},
+            query_errors={"晴天": RuntimeError("temporary failure")},
+        )
+
+        snapshot = await search.search(
+            session_id="chat-a",
+            query="晴天 周杰伦",
+            song_title="晴天",
+        )
+
+        self.assertEqual(bilibili.search_queries, ["晴天 周杰伦", "晴天"])
+        self.assertEqual(
+            [candidate.candidate_id for candidate in snapshot.candidates],
+            ["BV1:1"],
+        )
+
+    async def test_exact_av_reference_expands_server_pages_without_searching(
+        self,
+    ) -> None:
+        exact_video = video(
+            "BV1canonical",
+            title="完整视频",
+            pages=(
+                Page(11, "P1 正片", 269_000),
+                Page(12, "P2 伴奏", 269_000),
+            ),
+        )
+        search, _, bilibili, _ = await self._workflow(
+            (),
+            reference_videos={170001: exact_video},
+        )
+
+        snapshot = await search.search(
+            session_id="chat-a",
+            query="下载 av170001",
+            song_title="不会用于选 P",
+            video_ref=BilibiliVideoRef(aid=170001),
+        )
+
+        self.assertEqual(snapshot.query, "av170001")
+        self.assertEqual(bilibili.search_queries, [])
+        self.assertEqual(bilibili.aid_calls, [170001])
+        self.assertEqual(
+            [candidate.candidate_id for candidate in snapshot.candidates],
+            ["BV1canonical:11", "BV1canonical:12"],
+        )
+
+    async def test_exact_reference_failure_never_falls_back_to_keyword_search(
+        self,
+    ) -> None:
+        search, _, bilibili, _ = await self._workflow(
+            (),
+            reference_error=RuntimeError("missing video"),
+        )
+
+        with self.assertRaisesRegex(MusicSearchError, "无法打开"):
+            await search.search(
+                session_id="chat-a",
+                query="下载 BV1Q541167Qg",
+                video_ref=BilibiliVideoRef(bvid="BV1Q541167Qg"),
+            )
+
+        self.assertEqual(bilibili.search_queries, [])
+        self.assertEqual(bilibili.video_calls, ["BV1Q541167Qg"])
+
+    async def test_song_title_fallback_scans_past_primary_duplicates(self) -> None:
+        search, _, bilibili, _ = await self._workflow(
+            (video("BV1"), video("BV2"), video("BV3")),
+            query_hits={
+                "晴天 周杰伦": ("BV1",),
+                "晴天": ("BV1",) * 10 + ("BV2", "BV3"),
+            },
+        )
+
+        snapshot = await search.search(
+            session_id="chat-a",
+            query="晴天 周杰伦",
+            song_title="晴天",
+        )
+
+        self.assertEqual(bilibili.search_queries, ["晴天 周杰伦", "晴天"])
+        self.assertEqual(
+            [candidate.candidate_id for candidate in snapshot.candidates],
+            ["BV1:1", "BV2:1", "BV3:1"],
+        )
+
+    async def test_search_retains_all_deliverable_labels_in_source_order(
+        self,
+    ) -> None:
         videos = (
             video(
                 "BVmv",
                 title="爱人 Official MV",
                 pages=(Page(1, "爱人 Official MV", 269_000),),
-                category="MV",
             ),
             video(
                 "BVstory",
                 title="爱人的情感故事",
                 pages=(Page(1, "爱人的情感故事", 269_000),),
-                category="情感",
             ),
         )
         search, _, _, _ = await self._workflow(videos)
@@ -215,11 +372,8 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await search.search(session_id="chat-a", query="爱人")
 
         self.assertEqual(
-            [
-                (candidate.candidate_id, candidate.category)
-                for candidate in snapshot.candidates
-            ],
-            [("BVmv:1", "MV")],
+            [candidate.candidate_id for candidate in snapshot.candidates],
+            ["BVmv:1", "BVstory:1"],
         )
 
     async def test_candidate_summary_keeps_search_title_without_source_metadata(
@@ -230,7 +384,6 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
             title="详情页标题",
             uploader="不应暴露的上传者",
             pages=(Page(7, "P2 歌曲页", 269_000),),
-            category="MV",
         )
         search, _, _, _ = await self._workflow((source,))
 
@@ -256,9 +409,7 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
             {"position", "title", "duration", "search_title", "page_title"},
         )
 
-    async def test_search_can_exclude_alternative_versions_without_rewriting_keyword(
-        self,
-    ) -> None:
+    async def test_search_keeps_version_labels_for_llm_selection(self) -> None:
         original = video("BVoriginal")
         live = video(
             "BVlive",
@@ -267,21 +418,16 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         search, _, bilibili, _ = await self._workflow((live, original))
 
-        snapshot = await search.search(
-            session_id="chat-a",
-            query="晴天",
-            exclude_alternative_versions=True,
-        )
+        snapshot = await search.search(session_id="chat-a", query="晴天")
 
         self.assertEqual(bilibili.search_queries, ["晴天"])
         self.assertEqual(snapshot.query, "晴天")
         self.assertEqual(
-            [item.candidate_id for item in snapshot.candidates], ["BVoriginal:1"]
+            [item.candidate_id for item in snapshot.candidates],
+            ["BVlive:1", "BVoriginal:1"],
         )
 
-    async def test_alternative_filter_does_not_override_an_explicit_version(
-        self,
-    ) -> None:
+    async def test_search_keeps_explicit_version_in_the_source_query(self) -> None:
         original = video("BVoriginal")
         live = video(
             "BVlive",
@@ -290,15 +436,12 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         search, _, bilibili, _ = await self._workflow((original, live))
 
-        snapshot = await search.search(
-            session_id="chat-a",
-            query="晴天 Live",
-            exclude_alternative_versions=True,
-        )
+        snapshot = await search.search(session_id="chat-a", query="晴天 Live")
 
         self.assertEqual(bilibili.search_queries, ["晴天 live"])
         self.assertEqual(
-            [item.candidate_id for item in snapshot.candidates], ["BVlive:1"]
+            [item.candidate_id for item in snapshot.candidates],
+            ["BVoriginal:1", "BVlive:1"],
         )
 
     async def test_search_returns_a_session_bound_candidate_snapshot(self) -> None:
@@ -372,10 +515,12 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await search.search(
             session_id="chat-a",
             query="爱人 莉莉周她说 Lily Chou-Chou Lied",
-            exclude_alternative_versions=True,
         )
 
-        self.assertEqual(snapshot.candidates[0].candidate_id, "BVofficial:1")
+        self.assertEqual(
+            [candidate.candidate_id for candidate in snapshot.candidates],
+            ["BVofficial:1", "BVai:1"],
+        )
         self.assertEqual(
             bilibili.search_queries,
             ["爱人 莉莉周她说 lily chou-chou lied"],
@@ -431,8 +576,7 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
             (
                 video(
                     "BVwrong",
-                    title="晴天 吉他教学教程",
-                    pages=(Page(1, "晴天", 223_000),),
+                    pages=(Page(1, "晴天", 0),),
                 ),
             )
         )

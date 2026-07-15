@@ -38,8 +38,8 @@ NeriPlayer 是历史设计参考，帮助本项目厘清视频与具体分 P 的
 
 | 问题 | 优先阅读 | 保持的原则 |
 | --- | --- | --- |
-| 候选是否可交付、是否该自动播放 | NeriPlayer 的页解析安全参考；本项目 `core/matcher.py` 测试 | 具体分 P、受限候选、硬过滤、版本不偷换 |
+| 候选是否可交付、是否该自动播放 | NeriPlayer 的页解析安全参考；本项目 `core/matcher.py` 测试 | 具体分 P、受限候选、可交付性守卫、身份不偷换 |
 | Bilibili 请求、WBI、DASH、备用 URL | 本项目 `core/bilibili.py` 与 `core/media.py` | 单源、具体 `bvid:cid`、失败不换歌 |
 | AstrBot 命令、LLM、等待、媒体发送、WebUI | `astrbot_plugin_music` 的 AstrBot 使用方式；本项目 `main.py` 测试 | 维持当前小边界，不带回旧架构 |
 
-当前独立仓库尚未配置公开 Git remote；维护者在首次发布时应在项目根 README 和 `metadata.yaml` 补充本项目链接。上面两个链接是参考项目的确切 GitHub 地址，不是本项目的镜像或依赖。
+本项目仓库为 [57Darling02/astrbot_plugin_listen_music](https://github.com/57Darling02/astrbot_plugin_listen_music)。上面两个链接是参考项目的确切 GitHub 地址，不是本项目的镜像或依赖。

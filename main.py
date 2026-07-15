@@ -39,7 +39,7 @@ from .core.accounts import (
     QrLoginPoll,
     QrLoginStart,
 )
-from .core.bilibili import BilibiliClient
+from .core.bilibili import BilibiliClient, parse_bilibili_video_ref
 from .core.media import FfmpegUnavailableError, MediaError, MediaStore
 from .core.models import BilibiliCandidate, SearchSnapshot
 from .core.selection import SearchSnapshotStore
@@ -147,7 +147,7 @@ class _MusicRequest:
 
     @property
     def query(self) -> str:
-        """Keep the source query construction in the plugin, not the LLM."""
+        """Keep source-query construction in the plugin, not the LLM."""
 
         parts = [self.title]
         if self.artist:
@@ -381,6 +381,7 @@ class SearchMusicTool(FunctionTool):
             description=(
                 "仅用于用户明确搜索、找歌或下载歌曲。工具会直接展示候选，用户自行回复序号听歌，"
                 "或回复“序号 下载”收文件。下载必须调用本工具，不能自动选择下载版本。"
+                "用户原文中给出 AV/BV 或标准 Bilibili 视频链接时也使用本工具，插件会精确展开该视频的分 P。"
                 "这是终止型工具：调用前后不要输出过程、解释或补充文字。"
             ),
             parameters=_music_request_parameters(),
@@ -519,6 +520,7 @@ class ListenMusicPlugin(Star):
             snapshot = await self._require_search().search(
                 session_id=session_id,
                 query=query,
+                video_ref=parse_bilibili_video_ref(query),
             )
         except MusicSearchError as exc:
             yield event.plain_result(str(exc))
@@ -559,7 +561,7 @@ class ListenMusicPlugin(Star):
                 session_id=session_id,
                 query=music.query,
                 song_title=music.title,
-                exclude_alternative_versions=music.prefers_canonical_recording,
+                video_ref=parse_bilibili_video_ref(event.message_str),
             )
             if not await self._start_selection_wait(event, snapshot):
                 await self._send_llm_tool_failure(event, "插件正在停止，无法继续选歌。")
@@ -600,7 +602,6 @@ class ListenMusicPlugin(Star):
                 session_id=session_id,
                 query=music.query,
                 song_title=music.title,
-                exclude_alternative_versions=True,
             )
             if not self._complete_llm_search(session_id, lease, snapshot):
                 return _tool_error("歌曲请求已被新的消息替换")

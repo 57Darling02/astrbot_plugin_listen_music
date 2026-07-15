@@ -15,7 +15,66 @@ from support import ensure_aiohttp
 
 ensure_aiohttp()
 
-from core.bilibili import BilibiliClient, derive_wbi_mixin_key, sign_wbi_params
+from core.bilibili import (
+    BilibiliClient,
+    BilibiliVideoRef,
+    derive_wbi_mixin_key,
+    parse_bilibili_video_ref,
+    sign_wbi_params,
+)
+
+
+class BilibiliVideoRefTests(unittest.TestCase):
+    def test_parse_accepts_literal_ids_and_standard_video_urls(self) -> None:
+        bvid = "BV1Q541167Qg"
+        cases = (
+            (bvid, BilibiliVideoRef(bvid=bvid)),
+            ("请下载 bv1Q541167Qg", BilibiliVideoRef(bvid=bvid)),
+            (
+                f"https://www.bilibili.com/video/{bvid}/?p=2",
+                BilibiliVideoRef(bvid=bvid),
+            ),
+            ("https://www.bilibili.com/video/AV170001", BilibiliVideoRef(aid=170001)),
+        )
+
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(parse_bilibili_video_ref(value), expected)
+
+    def test_parse_uses_the_first_legal_token(self) -> None:
+        self.assertEqual(
+            parse_bilibili_video_ref("先 AV170001，后 BV1Q541167Qg"),
+            BilibiliVideoRef(aid=170001),
+        )
+        self.assertEqual(
+            parse_bilibili_video_ref("BV1Q541167Qg 和 av170001"),
+            BilibiliVideoRef(bvid="BV1Q541167Qg"),
+        )
+
+    def test_parse_rejects_invalid_ids_and_unresolved_short_links(self) -> None:
+        for value in (
+            "BV1fixture",
+            "BV1Q541167Qg0",
+            "av0",
+            "av170001suffix",
+            "av99999999999999999999",
+            "https://b23.tv/abcDef",
+            None,
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(parse_bilibili_video_ref(value))
+
+    def test_reference_requires_exactly_one_valid_identifier(self) -> None:
+        invalid_refs = (
+            {},
+            {"aid": 0},
+            {"aid": 170001, "bvid": "BV1Q541167Qg"},
+            {"bvid": "BV1fixture"},
+        )
+        for kwargs in invalid_refs:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    BilibiliVideoRef(**kwargs)
 
 
 class FixtureBilibiliClient(BilibiliClient):
@@ -90,6 +149,22 @@ class FixtureBilibiliClient(BilibiliClient):
         }
 
 
+class AidFixtureBilibiliClient(BilibiliClient):
+    def __init__(self) -> None:
+        super().__init__(session=object())
+        self.view_requests: list[dict[str, int]] = []
+
+    async def _wbi_data(self, endpoint, params):
+        self.view_requests.append(dict(params))
+        return {
+            "aid": 170001,
+            "bvid": "BV1Q541167Qg",
+            "title": "规范视频",
+            "owner": {"name": "测试账号"},
+            "pages": [{"cid": 99, "page": 1, "part": "音频", "duration": 269}],
+        }
+
+
 class BilibiliProtocolTests(unittest.IsolatedAsyncioTestCase):
     def test_wbi_signing_fixture_filters_reserved_characters(self) -> None:
         key = derive_wbi_mixin_key(
@@ -111,10 +186,9 @@ class BilibiliProtocolTests(unittest.IsolatedAsyncioTestCase):
         client = FixtureBilibiliClient(session=object())
         videos = await client.search_videos("晴天")
         self.assertEqual(videos[0].title, "晴天")
-        self.assertEqual(videos[0].duration_ms, 269000)
         self.assertEqual(
-            [(video.bvid, video.category) for video in videos],
-            [("BV1fixture", "MV"), ("BV1unrelated", "情感")],
+            [(video.bvid, video.title) for video in videos],
+            [("BV1fixture", "晴天"), ("BV1unrelated", "晴天里的情感故事")],
         )
 
         video = await client.get_video(videos[0].bvid)
@@ -131,6 +205,15 @@ class BilibiliProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             audio.headers["Referer"], "https://www.bilibili.com/video/BV1fixture/"
         )
+
+    async def test_get_video_by_aid_uses_server_canonical_bvid(self) -> None:
+        client = AidFixtureBilibiliClient()
+
+        video = await client.get_video_by_aid(170001)
+
+        self.assertEqual(client.view_requests, [{"aid": 170001}])
+        self.assertEqual(video.bvid, "BV1Q541167Qg")
+        self.assertEqual([(page.cid, page.index) for page in video.pages], [(99, 1)])
 
 
 if __name__ == "__main__":

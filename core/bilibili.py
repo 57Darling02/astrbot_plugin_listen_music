@@ -116,6 +116,13 @@ _HTML_TAG_RE = re.compile(r"<[^>]*>")
 _WHITESPACE_RE = re.compile(r"\s+")
 _WBI_FILTER_RE = re.compile(r"[!'()*]")
 _COOKIE_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+_BVID_VALUE_RE = re.compile(r"bv[0-9A-Za-z]{10}", re.IGNORECASE)
+_VIDEO_REF_TOKEN_RE = re.compile(
+    r"(?<![0-9A-Za-z])(?:"
+    r"(?P<bvid>bv[0-9A-Za-z]{10})|(?P<aid>av[1-9][0-9]{0,18})"
+    r")(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
 
 CookieMap: TypeAlias = Mapping[str, str]
 CookieGetter: TypeAlias = Callable[[], CookieMap | Awaitable[CookieMap | None] | None]
@@ -136,26 +143,64 @@ class BilibiliApiError(BilibiliError):
 
 
 @dataclass(frozen=True, slots=True)
+class BilibiliVideoRef:
+    """One literal Bilibili video identifier supplied by a user.
+
+    A reference carries either an ``aid`` or a ``bvid``.  It intentionally
+    stops short of resolving AV IDs locally: callers must ask Bilibili for the
+    canonical video detail before a page can be delivered.
+    """
+
+    aid: int | None = None
+    bvid: str | None = None
+
+    def __post_init__(self) -> None:
+        if (self.aid is None) == (self.bvid is None):
+            raise ValueError("exactly one of aid or bvid must be provided")
+        if self.aid is not None:
+            if (
+                isinstance(self.aid, bool)
+                or not isinstance(self.aid, int)
+                or self.aid <= 0
+            ):
+                raise ValueError("aid must be a positive integer")
+            return
+
+        if not isinstance(self.bvid, str) or not _BVID_VALUE_RE.fullmatch(self.bvid):
+            raise ValueError("bvid must be a Bilibili BV identifier")
+        object.__setattr__(self, "bvid", f"BV{self.bvid[2:]}")
+
+
+def parse_bilibili_video_ref(value: str | None) -> BilibiliVideoRef | None:
+    """Extract the first literal AV or BV identifier from user-supplied text.
+
+    This is deliberately a pure parser.  Standard ``bilibili.com/video`` URLs
+    work because their literal AV/BV token is extracted; ``b23.tv`` links are
+    not followed or otherwise resolved.
+    """
+
+    if not isinstance(value, str):
+        return None
+    match = _VIDEO_REF_TOKEN_RE.search(value)
+    if match is None:
+        return None
+    bvid = match.group("bvid")
+    if bvid is not None:
+        return BilibiliVideoRef(bvid=bvid)
+    aid = match.group("aid")
+    return BilibiliVideoRef(aid=int(aid[2:])) if aid is not None else None
+
+
+@dataclass(frozen=True, slots=True)
 class BilibiliSearchVideo:
     """A video-level hit returned by Bilibili search.
 
     ``title`` is the exact search-hit title, before a later video-detail
     request potentially supplies a different title for the same BV.
-    ``category`` is Bilibili's own ``typename`` value.  It remains attached to
-    the hit so the workflow can discard only categories that are plainly not
-    music, without trying to manufacture a positive music taxonomy.
     """
 
-    aid: int
     bvid: str
     title: str
-    uploader: str
-    duration_ms: int
-    category: str = ""
-
-    @property
-    def page_url(self) -> str:
-        return f"{BILIBILI_WEB_ORIGIN}/video/{self.bvid}/"
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,16 +217,10 @@ class BilibiliPage:
 class BilibiliVideo:
     """The subset of video detail needed by the music search workflow."""
 
-    aid: int
     bvid: str
     title: str
     uploader: str
-    duration_ms: int
     pages: tuple[BilibiliPage, ...]
-
-    @property
-    def page_url(self) -> str:
-        return f"{BILIBILI_WEB_ORIGIN}/video/{self.bvid}/"
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,22 +342,6 @@ def _strip_html(value: Any) -> str:
     return _WHITESPACE_RE.sub(" ", _HTML_TAG_RE.sub("", text)).strip()
 
 
-def _parse_duration_ms(value: Any) -> int:
-    """Parse Bilibili's ``HH:MM:SS`` search duration into milliseconds."""
-    text = str(value or "").strip()
-    if not text:
-        return 0
-    if text.isdigit():
-        return int(text) * 1000
-    parts = text.split(":")
-    if not parts or any(not part.isdigit() for part in parts):
-        return 0
-    seconds = 0
-    for part in parts:
-        seconds = seconds * 60 + int(part)
-    return seconds * 1000
-
-
 def _normalise_url(value: Any) -> str:
     url = str(value or "").strip()
     if url.startswith("//"):
@@ -408,12 +431,8 @@ class BilibiliClient:
                 continue
             videos.append(
                 BilibiliSearchVideo(
-                    aid=_to_int(raw.get("aid")),
                     bvid=bvid,
                     title=title,
-                    uploader=_strip_html(raw.get("author")) or "未知上传者",
-                    duration_ms=_parse_duration_ms(raw.get("duration")),
-                    category=_strip_html(raw.get("typename")),
                 )
             )
             if len(videos) >= bounded_limit:
@@ -424,7 +443,22 @@ class BilibiliClient:
         """Fetch a video's current page list for matching and audio resolution."""
         normalized_bvid = _normalise_bvid(bvid)
         data = await self._wbi_data(_VIEW_URL, {"bvid": normalized_bvid})
-        resolved_bvid = str(data.get("bvid") or normalized_bvid).strip()
+        return self._parse_video_detail(data, fallback_bvid=normalized_bvid)
+
+    async def get_video_by_aid(self, aid: int) -> BilibiliVideo:
+        """Fetch video detail by AV ID and retain Bilibili's canonical BV ID."""
+        if isinstance(aid, bool) or not isinstance(aid, int) or aid <= 0:
+            raise ValueError("aid must be a positive integer")
+        data = await self._wbi_data(_VIEW_URL, {"aid": aid})
+        return self._parse_video_detail(data, fallback_bvid=None)
+
+    @staticmethod
+    def _parse_video_detail(
+        data: Mapping[str, Any], *, fallback_bvid: str | None
+    ) -> BilibiliVideo:
+        resolved_bvid = str(data.get("bvid") or fallback_bvid or "").strip()
+        if not resolved_bvid:
+            raise BilibiliError("Bilibili returned a video without a BV identifier")
         raw_pages = data.get("pages")
         pages: list[BilibiliPage] = []
         if isinstance(raw_pages, list):
@@ -456,7 +490,6 @@ class BilibiliClient:
                 )
 
         return BilibiliVideo(
-            aid=_to_int(data.get("aid")),
             bvid=resolved_bvid,
             title=_strip_html(data.get("title")) or resolved_bvid,
             uploader=_strip_html(
@@ -465,7 +498,6 @@ class BilibiliClient:
                 else ""
             )
             or "未知上传者",
-            duration_ms=max(0, _to_int(data.get("duration"))) * 1000,
             pages=tuple(pages),
         )
 

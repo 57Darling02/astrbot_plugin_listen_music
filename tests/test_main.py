@@ -252,7 +252,6 @@ class _Candidate:
         self.display_title = title
         self.uploader = "fixture-up"
         self.duration_ms = 180_000
-        self.category = "音乐"
         self.search_title = f"搜索命中 {title}"
         self.page_title = "正片"
 
@@ -438,7 +437,6 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                     "session_id": "chat-a",
                     "query": "一路生花 温奕心",
                     "song_title": "一路生花",
-                    "exclude_alternative_versions": True,
                 }
             ],
         )
@@ -458,7 +456,6 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
             "bvid",
             "cid",
             "uploader",
-            "category",
             first.bvid,
             str(first.cid),
             first.uploader,
@@ -715,7 +712,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                     "session_id": "chat-a",
                     "query": "不存在的歌 示例歌手",
                     "song_title": "不存在的歌",
-                    "exclude_alternative_versions": True,
+                    "video_ref": None,
                 }
             ],
         )
@@ -759,7 +756,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                     "session_id": "chat-a",
                     "query": "晴天 周杰伦 录音室版",
                     "song_title": "晴天",
-                    "exclude_alternative_versions": False,
+                    "video_ref": None,
                 }
             ],
         )
@@ -773,6 +770,88 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
 
         await plugin._cancel_selection_wait("chat-a")
         self.assertEqual(plugin._selection_waits, {})
+
+    async def test_search_music_uses_an_av_reference_only_from_user_message(
+        self,
+    ) -> None:
+        snapshot = _Snapshot((_Candidate("BV1fixture:1", "指定视频"),))
+
+        class FakeSearch:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def search(self, **kwargs):
+                self.calls.append(kwargs)
+                return snapshot
+
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._search = search = FakeSearch()
+        _configure_selection_waits(plugin)
+        event = _SendingEvent("chat-a", "下载 av170001")
+
+        await plugin.present_music_search_for_llm(event, "模型整理出的标题")
+
+        reference = search.calls[0]["video_ref"]
+        self.assertIsNotNone(reference)
+        assert reference is not None
+        self.assertEqual(reference.aid, 170001)
+        self.assertIsNone(reference.bvid)
+        await plugin._cancel_selection_wait("chat-a")
+
+    async def test_search_music_does_not_trust_a_model_supplied_bv_reference(
+        self,
+    ) -> None:
+        snapshot = _Snapshot((_Candidate("BV1fixture:1", "普通搜索"),))
+
+        class FakeSearch:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def search(self, **kwargs):
+                self.calls.append(kwargs)
+                return snapshot
+
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._search = search = FakeSearch()
+        _configure_selection_waits(plugin)
+
+        await plugin.present_music_search_for_llm(
+            _SendingEvent("chat-a", "下载晴天"),
+            "BV1Q541167Qg",
+        )
+
+        self.assertIsNone(search.calls[0]["video_ref"])
+        await plugin._cancel_selection_wait("chat-a")
+
+    async def test_search_command_uses_a_bv_reference_from_its_query(self) -> None:
+        snapshot = _Snapshot((_Candidate("BV1fixture:1", "指定视频"),))
+
+        class FakeSearch:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def search(self, **kwargs):
+                self.calls.append(kwargs)
+                return snapshot
+
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._search = search = FakeSearch()
+        _configure_selection_waits(plugin)
+        event = _SendingEvent("chat-a", "搜索歌曲 BV1Q541167Qg")
+
+        results = [
+            result
+            async for result in plugin.search_song(
+                event, listen_main.GreedyStr("BV1Q541167Qg")
+            )
+        ]
+
+        self.assertEqual(len(results), 1)
+        reference = search.calls[0]["video_ref"]
+        self.assertIsNotNone(reference)
+        assert reference is not None
+        self.assertEqual(reference.bvid, "BV1Q541167Qg")
+        await plugin._cancel_selection_wait("chat-a")
 
     async def test_search_song_uses_the_same_selection_session(self) -> None:
         snapshot = _Snapshot((_Candidate("BV1fixture:1", "晴天"),))
