@@ -13,10 +13,13 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 from core.media import (
+    DOWNLOAD_MEDIA_LIMITS,
     FfmpegUnavailableError,
     MediaError,
+    MediaLimits,
     MediaStore,
     MediaTooLargeError,
+    VOICE_MEDIA_LIMITS,
 )
 from core.models import ResolvedAudio
 
@@ -74,6 +77,16 @@ class GateContent(FakeContent):
         self.started.set()
         await self.continue_download.wait()
         yield b"audio-bytes"
+
+
+class DelayedResponse(FakeResponse):
+    def __init__(self, *args, delay_seconds: float, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._delay_seconds = delay_seconds
+
+    async def __aenter__(self):
+        await asyncio.sleep(self._delay_seconds)
+        return self
 
 
 def audio(**overrides: object) -> ResolvedAudio:
@@ -139,16 +152,116 @@ class MediaStoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reclaims_partial_file_when_stream_exceeds_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            store = MediaStore(
-                FakeSession([FakeResponse([b"123456"])]),
-                directory,
+            store = MediaStore(FakeSession([FakeResponse([b"123456"])]), directory)
+            store._ffmpeg_path = "/bin/true"
+            limits = MediaLimits(
                 max_bytes=5,
+                max_duration_ms=VOICE_MEDIA_LIMITS.max_duration_ms,
+                download_timeout_seconds=VOICE_MEDIA_LIMITS.download_timeout_seconds,
             )
+
+            with self.assertRaisesRegex(MediaTooLargeError, "5 B"):
+                await store.prepare(
+                    audio(),
+                    filename_stem="too-large",
+                    limits=limits,
+                )
+
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            await store.aclose()
+
+    async def test_voice_limits_reject_long_audio_before_network_io(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = FakeSession([FakeResponse([b"audio"])])
+            store = MediaStore(session, directory)
+            store._ffmpeg_path = "/bin/true"
+            assert VOICE_MEDIA_LIMITS.max_duration_ms is not None
+
+            with self.assertRaisesRegex(MediaError, "15 分钟"):
+                await store.prepare(
+                    audio(duration_ms=VOICE_MEDIA_LIMITS.max_duration_ms + 1),
+                    filename_stem="long-voice",
+                )
+
+            self.assertEqual(session.calls, [])
+            await store.aclose()
+
+    async def test_download_limits_allow_long_audio_and_release_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = FakeSession([FakeResponse([b"long-audio"])])
+            store = MediaStore(session, directory)
+            store._ffmpeg_path = "/bin/true"
+            assert VOICE_MEDIA_LIMITS.max_duration_ms is not None
+
+            prepared = await store.prepare(
+                audio(duration_ms=VOICE_MEDIA_LIMITS.max_duration_ms + 1),
+                filename_stem="long-download",
+                limits=DOWNLOAD_MEDIA_LIMITS,
+            )
+
+            self.assertTrue(prepared.path.is_file())
+            await store.release(prepared)
+            self.assertFalse(prepared.path.exists())
+            await store.aclose()
+
+    async def test_download_limits_bound_size_and_network_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = FakeSession(
+                [
+                    FakeResponse(
+                        [],
+                        content_length=DOWNLOAD_MEDIA_LIMITS.max_bytes + 1,
+                    )
+                ]
+            )
+            store = MediaStore(session, directory)
             store._ffmpeg_path = "/bin/true"
 
-            with self.assertRaises(MediaTooLargeError):
-                await store.prepare(audio(), filename_stem="too-large")
+            with self.assertRaisesRegex(MediaTooLargeError, "100 MiB"):
+                await store.prepare(
+                    audio(duration_ms=60 * 60 * 1000),
+                    filename_stem="oversized-download",
+                    limits=DOWNLOAD_MEDIA_LIMITS,
+                )
 
+            timeout = session.calls[0]["timeout"]
+            self.assertEqual(timeout.total, 900)
+            self.assertEqual(timeout.connect, 15)
+            self.assertEqual(timeout.sock_read, 120)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            await store.aclose()
+
+    async def test_backup_urls_share_one_download_timeout_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            limits = MediaLimits(
+                max_bytes=1024,
+                max_duration_ms=None,
+                download_timeout_seconds=0.1,
+            )
+            waiting_backup = GateContent()
+            session = FakeSession(
+                [
+                    DelayedResponse([], status=500, delay_seconds=0.06),
+                    FakeResponse(waiting_backup),
+                ]
+            )
+            store = MediaStore(session, directory)
+            store._ffmpeg_path = "/bin/true"
+
+            with self.assertRaisesRegex(MediaError, "音源下载超时"):
+                await asyncio.wait_for(
+                    store.prepare(
+                        audio(
+                            backup_urls=("https://backup.example.test/audio.m4s",),
+                        ),
+                        filename_stem="timed-out-download",
+                        limits=limits,
+                    ),
+                    timeout=0.5,
+                )
+
+            self.assertEqual(len(session.calls), 2)
+            self.assertTrue(waiting_backup.started.is_set())
             self.assertEqual(list(Path(directory).iterdir()), [])
             await store.aclose()
 

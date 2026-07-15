@@ -437,6 +437,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                     "session_id": "chat-a",
                     "query": "一路生花 温奕心",
                     "song_title": "一路生花",
+                    "max_duration_ms": listen_main.VOICE_MEDIA_LIMITS.max_duration_ms,
                 }
             ],
         )
@@ -546,8 +547,9 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                 return snapshot
 
         class FakeDelivery:
-            async def deliver(self, selected):
+            async def deliver(self, selected, *, limits):
                 self.selected = selected
+                self.limits = limits
                 return result
 
         class FakeMedia:
@@ -576,6 +578,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
             [{"search_id": "fixture-search", "session_id": "chat-a"}],
         )
         self.assertIs(delivery.selected, candidate)
+        self.assertIs(delivery.limits, listen_main.VOICE_MEDIA_LIMITS)
         self.assertEqual(
             event.sent,
             [
@@ -591,7 +594,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("hallucinated search ID must not reach the store")
 
         class FailingDelivery:
-            async def deliver(self, _candidate):
+            async def deliver(self, _candidate, *, limits):
                 raise AssertionError("hallucinated search ID must not deliver")
 
         plugin = object.__new__(listen_main.ListenMusicPlugin)
@@ -616,7 +619,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                 return snapshot
 
         class FailingDelivery:
-            async def deliver(self, _candidate):
+            async def deliver(self, _candidate, *, limits):
                 raise AssertionError("a position outside the snapshot must not deliver")
 
         plugin = object.__new__(listen_main.ListenMusicPlugin)
@@ -639,7 +642,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         class FailingDelivery:
-            async def deliver(self, _candidate):
+            async def deliver(self, _candidate, *, limits):
                 raise AssertionError("expired search must not deliver")
 
         plugin = object.__new__(listen_main.ListenMusicPlugin)
@@ -664,7 +667,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                 raise AssertionError("another session must not access this search")
 
         class FailingDelivery:
-            async def deliver(self, _candidate):
+            async def deliver(self, _candidate, *, limits):
                 raise AssertionError("another session must not deliver")
 
         plugin = object.__new__(listen_main.ListenMusicPlugin)
@@ -895,8 +898,9 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                 return snapshot
 
         class FakeDelivery:
-            async def deliver(self, selected):
+            async def deliver(self, selected, *, limits):
                 self.selected = selected
+                self.limits = limits
                 return result
 
         class FakeMedia:
@@ -919,6 +923,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         self.assertIs(delivery.selected, candidate)
+        self.assertIs(delivery.limits, listen_main.DOWNLOAD_MEDIA_LIMITS)
         self.assertEqual(reply.sent[0][0].kwargs["name"], "fixture.m4a")
         self.assertTrue(waiter.session_controller.stopped)
         self.assertEqual(plugin._selection_waits, {})
@@ -941,8 +946,9 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                 return snapshot
 
         class FakeDelivery:
-            async def deliver(self, selected):
+            async def deliver(self, selected, *, limits):
                 self.selected = selected
+                self.limits = limits
                 return result
 
         class FakeMedia:
@@ -963,11 +969,40 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
             [{"search_id": "fixture-search", "session_id": "chat-a"}],
         )
         self.assertIs(delivery.selected, candidate)
+        self.assertIs(delivery.limits, listen_main.DOWNLOAD_MEDIA_LIMITS)
         self.assertTrue(controller.stopped)
         component = reply.sent[0][0]
         self.assertEqual(component.kwargs["name"], "fixture.m4a")
         self.assertEqual(component.kwargs["file"], "/tmp/fixture.m4a")
         self.assertEqual(released, [media])
+
+    async def test_long_manual_voice_selection_keeps_wait_for_download(self) -> None:
+        candidate = _Candidate("BV1fixture:1", "长音频")
+        candidate.duration_ms = 16 * 60 * 1000
+        snapshot = _Snapshot((candidate,))
+
+        class FakeSearch:
+            def snapshot(self, **_kwargs):
+                return snapshot
+
+        class FailingDelivery:
+            async def deliver(self, _candidate, *, limits):
+                raise AssertionError("long voice must not start a delivery")
+
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._search = FakeSearch()
+        plugin._delivery = FailingDelivery()
+        plugin._media = types.SimpleNamespace()
+        controller = listen_main.SessionController()
+        reply = _SendingEvent("chat-a", "1")
+
+        await plugin._deliver_selection(controller, reply, snapshot)
+
+        self.assertFalse(controller.stopped)
+        self.assertEqual(
+            reply.sent,
+            [("plain", "第 1 首时长超过 15 分钟，仅可下载；请回复“1 下载”。")],
+        )
 
     async def test_expired_manual_selection_never_delivers_a_stale_candidate(
         self,
@@ -979,7 +1014,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         class FailingDelivery:
-            async def deliver(self, _candidate):
+            async def deliver(self, _candidate, *, limits):
                 raise AssertionError("expired selection must not deliver")
 
         plugin = object.__new__(listen_main.ListenMusicPlugin)
@@ -1173,7 +1208,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         released: list[object] = []
 
         class FakeDelivery:
-            async def deliver(self, _candidate):
+            async def deliver(self, _candidate, *, limits):
                 return result
 
         class FakeMedia:

@@ -93,7 +93,7 @@ class BilibiliCandidateFilterTests(unittest.TestCase):
             ["ai", "live", "cover", "remix", "tutorial", "mv"],
         )
 
-    def test_only_unplayable_durations_are_removed(self) -> None:
+    def test_only_non_positive_durations_are_removed_without_a_limit(self) -> None:
         pages = [
             candidate(bvid="unknown", duration_ms=0),
             candidate(bvid="too-long", duration_ms=15 * 60 * 1000 + 1),
@@ -103,7 +103,24 @@ class BilibiliCandidateFilterTests(unittest.TestCase):
 
         results = filter_bilibili_candidates(pages)
 
-        self.assertEqual([item.bvid for item in results], ["short-song", "normal"])
+        self.assertEqual(
+            [item.bvid for item in results],
+            ["too-long", "short-song", "normal"],
+        )
+
+    def test_optional_duration_limit_removes_only_long_pages(self) -> None:
+        pages = [
+            candidate(bvid="unknown", duration_ms=0),
+            candidate(bvid="too-long", duration_ms=15 * 60 * 1000 + 1),
+            candidate(bvid="at-limit", duration_ms=15 * 60 * 1000),
+        ]
+
+        results = filter_bilibili_candidates(
+            pages,
+            max_duration_ms=15 * 60 * 1000,
+        )
+
+        self.assertEqual([item.bvid for item in results], ["at-limit"])
 
     def test_deduplicates_and_applies_the_limit_in_platform_order(self) -> None:
         first = candidate(bvid="first", title="晴天")

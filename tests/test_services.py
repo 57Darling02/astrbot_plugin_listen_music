@@ -10,7 +10,11 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
-from core.media import MediaError
+from core.media import (
+    DOWNLOAD_MEDIA_LIMITS,
+    VOICE_MEDIA_LIMITS,
+    MediaError,
+)
 from core.bilibili import BilibiliVideoRef
 from core.models import LocalMedia, ResolvedAudio
 from core.services import (
@@ -121,9 +125,13 @@ class FakeMedia:
     def __init__(self, *, error: Exception | None = None) -> None:
         self._error = error
         self.prepared: list[ResolvedAudio] = []
+        self.limits: list[object] = []
 
-    async def prepare(self, audio: ResolvedAudio, *, filename_stem: str) -> LocalMedia:
+    async def prepare(
+        self, audio: ResolvedAudio, *, filename_stem: str, limits
+    ) -> LocalMedia:
         self.prepared.append(audio)
+        self.limits.append(limits)
         if self._error is not None:
             raise self._error
         return LocalMedia(
@@ -228,6 +236,30 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bilibili.search_queries, ["晴天"])
         self.assertEqual(snapshot.candidates[0].candidate_id, "BV1:1")
 
+    async def test_search_keeps_long_audio_without_a_duration_limit(self) -> None:
+        search, _, _, _ = await self._workflow(
+            (video("BVlong", pages=(Page(1, "长音频", 16 * 60 * 1000),)),)
+        )
+
+        snapshot = await search.search(session_id="chat-a", query="长音频")
+
+        self.assertEqual(
+            [item.candidate_id for item in snapshot.candidates], ["BVlong:1"]
+        )
+        self.assertIn("(16:00，仅可下载)", format_search_results(snapshot))
+
+    async def test_search_excludes_long_audio_with_a_duration_limit(self) -> None:
+        search, _, _, _ = await self._workflow(
+            (video("BVlong", pages=(Page(1, "长音频", 16 * 60 * 1000),)),)
+        )
+
+        with self.assertRaisesRegex(MusicSearchError, "没有找到"):
+            await search.search(
+                session_id="chat-a",
+                query="长音频",
+                max_duration_ms=15 * 60 * 1000,
+            )
+
     async def test_structured_song_title_fills_short_primary_results_once(self) -> None:
         videos = tuple(video(f"BV{index}") for index in range(1, 12))
         search, _, bilibili, _ = await self._workflow(
@@ -248,6 +280,32 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [candidate.candidate_id for candidate in snapshot.candidates],
             [f"BV{index}:1" for index in range(1, SEARCH_LIMIT + 1)],
+        )
+
+    async def test_song_title_fallback_uses_the_same_duration_limit(self) -> None:
+        search, _, bilibili, _ = await self._workflow(
+            (
+                video("BVprimary"),
+                video("BVlong", pages=(Page(1, "晴天 长内容", 16 * 60 * 1000),)),
+                video("BVfallback"),
+            ),
+            query_hits={
+                "晴天 周杰伦": ("BVprimary",),
+                "晴天": ("BVlong", "BVfallback"),
+            },
+        )
+
+        snapshot = await search.search(
+            session_id="chat-a",
+            query="晴天 周杰伦",
+            song_title="晴天",
+            max_duration_ms=15 * 60 * 1000,
+        )
+
+        self.assertEqual(bilibili.search_queries, ["晴天 周杰伦", "晴天"])
+        self.assertEqual(
+            [item.candidate_id for item in snapshot.candidates],
+            ["BVprimary:1", "BVfallback:1"],
         )
 
     async def test_song_title_equal_to_primary_query_does_not_search_twice(
@@ -311,6 +369,33 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [candidate.candidate_id for candidate in snapshot.candidates],
             ["BV1canonical:11", "BV1canonical:12"],
+        )
+
+    async def test_exact_reference_applies_the_duration_limit(self) -> None:
+        exact_video = video(
+            "BV1canonical",
+            title="完整视频",
+            pages=(
+                Page(11, "P1 短内容", 269_000),
+                Page(12, "P2 长内容", 16 * 60 * 1000),
+            ),
+        )
+        search, _, bilibili, _ = await self._workflow(
+            (),
+            reference_videos={170001: exact_video},
+        )
+
+        snapshot = await search.search(
+            session_id="chat-a",
+            query="下载 av170001",
+            video_ref=BilibiliVideoRef(aid=170001),
+            max_duration_ms=15 * 60 * 1000,
+        )
+
+        self.assertEqual(bilibili.search_queries, [])
+        self.assertEqual(
+            [candidate.candidate_id for candidate in snapshot.candidates],
+            ["BV1canonical:11"],
         )
 
     async def test_exact_reference_failure_never_falls_back_to_keyword_search(
@@ -538,6 +623,23 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.candidate, selected)
         self.assertEqual(bilibili.resolve_calls, [("BV2", 1)])
         self.assertEqual(len(media.prepared), 1)
+        self.assertEqual(media.limits, [VOICE_MEDIA_LIMITS])
+
+    async def test_long_audio_requires_download_limits_for_delivery(self) -> None:
+        search, delivery, bilibili, media = await self._workflow(
+            (video("BVlong", pages=(Page(1, "长音频", 16 * 60 * 1000),)),)
+        )
+        snapshot = await search.search(session_id="chat-a", query="长音频")
+        candidate = snapshot.candidates[0]
+
+        with self.assertRaisesRegex(DeliveryError, "序号 下载"):
+            await delivery.deliver(candidate)
+        self.assertEqual(bilibili.resolve_calls, [])
+
+        result = await delivery.deliver(candidate, limits=DOWNLOAD_MEDIA_LIMITS)
+        self.assertEqual(result.candidate, candidate)
+        self.assertEqual(bilibili.resolve_calls, [("BVlong", 1)])
+        self.assertEqual(media.limits, [DOWNLOAD_MEDIA_LIMITS])
 
     async def test_snapshot_rejects_cross_session_or_hallucinated_candidate_ids(
         self,

@@ -17,7 +17,14 @@ import unicodedata
 
 from .bilibili import BilibiliVideoRef
 from .matcher import filter_bilibili_candidates, prepare_bilibili_search_query
-from .media import FfmpegUnavailableError, MAX_MEDIA_DURATION_MS, MediaError, MediaStore
+from .media import (
+    FfmpegUnavailableError,
+    MediaError,
+    MediaLimits,
+    MediaStore,
+    MediaTooLargeError,
+    VOICE_MEDIA_LIMITS,
+)
 from .models import BilibiliCandidate, LocalMedia, SearchSnapshot
 from .selection import SearchSnapshotStore
 
@@ -90,6 +97,7 @@ class SearchService:
         query: str,
         song_title: str | None = None,
         video_ref: BilibiliVideoRef | None = None,
+        max_duration_ms: int | None = None,
     ) -> SearchSnapshot:
         """Search Bilibili and retain a session-bound candidate set.
 
@@ -114,12 +122,17 @@ class SearchService:
             requested_query, candidates = await self._filtered_candidates(
                 query,
                 song_title=song_title,
+                max_duration_ms=max_duration_ms,
             )
         else:
             requested_query = _video_ref_label(video_ref)
             candidates = filter_bilibili_candidates(
-                await self._reference_candidates(video_ref),
+                await self._reference_candidates(
+                    video_ref,
+                    max_duration_ms=max_duration_ms,
+                ),
                 limit=SEARCH_LIMIT,
+                max_duration_ms=max_duration_ms,
             )
             if not candidates:
                 raise MusicSearchError("指定的 Bilibili 视频没有可播放的音频")
@@ -134,6 +147,7 @@ class SearchService:
         query: str,
         *,
         song_title: str | None,
+        max_duration_ms: int | None,
     ) -> tuple[str, tuple[BilibiliCandidate, ...]]:
         requested_query = _normalize_query(query)
         api_query = prepare_bilibili_search_query(requested_query)
@@ -143,8 +157,13 @@ class SearchService:
         candidates = await self._search_candidates(
             api_query,
             song_title=song_title,
+            max_duration_ms=max_duration_ms,
         )
-        filtered = filter_bilibili_candidates(candidates, limit=SEARCH_LIMIT)
+        filtered = filter_bilibili_candidates(
+            candidates,
+            limit=SEARCH_LIMIT,
+            max_duration_ms=max_duration_ms,
+        )
 
         fallback_query = _song_title_fallback_query(song_title, api_query)
         if len(filtered) < SEARCH_LIMIT and fallback_query is not None:
@@ -152,6 +171,7 @@ class SearchService:
                 fallback_candidates = await self._search_candidates(
                     fallback_query,
                     song_title=song_title,
+                    max_duration_ms=max_duration_ms,
                 )
             except MusicSearchError:
                 # The second query improves recall only; a source failure must
@@ -160,6 +180,7 @@ class SearchService:
             filtered = _merge_candidates(
                 filtered,
                 fallback_candidates,
+                max_duration_ms=max_duration_ms,
             )
         if not filtered:
             raise MusicSearchError(f"没有找到“{requested_query}”的可播放 Bilibili 音乐")
@@ -175,6 +196,7 @@ class SearchService:
         api_query: str,
         *,
         song_title: str | None,
+        max_duration_ms: int | None,
     ) -> tuple[BilibiliCandidate, ...]:
         try:
             videos = await self._bilibili.search_videos(
@@ -208,6 +230,7 @@ class SearchService:
                     video,
                     search_title=str(getattr(search_hit, "title", "")).strip(),
                     song_title=song_title,
+                    max_duration_ms=max_duration_ms,
                 )
             )
             if len(candidates) >= BILIBILI_PAGE_LIMIT:
@@ -215,7 +238,10 @@ class SearchService:
         return tuple(candidates)
 
     async def _reference_candidates(
-        self, video_ref: BilibiliVideoRef
+        self,
+        video_ref: BilibiliVideoRef,
+        *,
+        max_duration_ms: int | None,
     ) -> tuple[BilibiliCandidate, ...]:
         """Resolve one user-provided video reference without keyword fallback."""
 
@@ -232,6 +258,7 @@ class SearchService:
             search_title=str(getattr(video, "title", "")).strip(),
             song_title=None,
             include_all_pages=True,
+            max_duration_ms=max_duration_ms,
         )
 
 
@@ -247,23 +274,33 @@ class DeliveryService:
         self._bilibili = bilibili
         self._media = media
 
-    async def deliver(self, candidate: BilibiliCandidate) -> DeliveryResult:
-        if candidate.duration_ms > MAX_MEDIA_DURATION_MS:
-            raise DeliveryError("歌曲时长超过 15 分钟，无法发送")
+    async def deliver(
+        self,
+        candidate: BilibiliCandidate,
+        *,
+        limits: MediaLimits = VOICE_MEDIA_LIMITS,
+    ) -> DeliveryResult:
+        """Materialize one selected page within its delivery-mode limits."""
+
+        if _duration_exceeds_limit(candidate.duration_ms, limits):
+            raise DeliveryError(_delivery_duration_error(limits))
         if not self._media.ffmpeg_available:
             raise FfmpegUnavailableError("宿主机未安装 ffmpeg，暂时无法听歌或下载歌曲")
         try:
             audio = await self._bilibili.resolve_audio(candidate.bvid, candidate.cid)
-            if audio.duration_ms and audio.duration_ms > MAX_MEDIA_DURATION_MS:
-                raise DeliveryError("Bilibili 音频时长超过 15 分钟，无法发送")
+            if _duration_exceeds_limit(audio.duration_ms, limits):
+                raise DeliveryError(_delivery_duration_error(limits))
             media = await self._media.prepare(
                 audio,
                 filename_stem=_display_stem(candidate),
+                limits=limits,
             )
         except FfmpegUnavailableError:
             raise
         except DeliveryError:
             raise
+        except MediaTooLargeError as exc:
+            raise DeliveryError(str(exc)) from exc
         except MediaError as exc:
             raise DeliveryError("Bilibili 音频下载失败") from exc
         except Exception as exc:
@@ -276,8 +313,14 @@ def format_search_results(snapshot: SearchSnapshot) -> str:
 
     lines = [f"Bilibili 搜索结果：{snapshot.query}"]
     for position, candidate in enumerate(snapshot.candidates, start=1):
+        download_only = (
+            "，仅可下载"
+            if _duration_exceeds_limit(candidate.duration_ms, VOICE_MEDIA_LIMITS)
+            else ""
+        )
         lines.append(
-            f"{position}. {candidate.display_title} ({_duration_text(candidate.duration_ms)})"
+            f"{position}. {candidate.display_title} "
+            f"({_duration_text(candidate.duration_ms)}{download_only})"
         )
     lines.append("回复序号听歌；回复“序号 下载”发送文件。")
     return "\n".join(lines)
@@ -321,6 +364,7 @@ def _expand_video_candidates(
     search_title: str,
     song_title: str | None,
     include_all_pages: bool = False,
+    max_duration_ms: int | None = None,
 ) -> tuple[BilibiliCandidate, ...]:
     """Turn one validated video detail response into bounded page candidates."""
 
@@ -336,7 +380,7 @@ def _expand_video_candidates(
     for page in selected_pages:
         cid = _positive_int(getattr(page, "cid", 0))
         duration_ms = _nonnegative_int(getattr(page, "duration_ms", 0))
-        if not cid or not 0 < duration_ms <= MAX_MEDIA_DURATION_MS:
+        if not cid or not _is_within_duration_limit(duration_ms, max_duration_ms):
             continue
         try:
             candidates.append(
@@ -374,12 +418,24 @@ def _song_title_fallback_query(
 def _merge_candidates(
     primary: Sequence[BilibiliCandidate],
     fallback: Sequence[BilibiliCandidate],
+    *,
+    max_duration_ms: int | None,
 ) -> tuple[BilibiliCandidate, ...]:
     """Preserve primary ordering while deduplicating a bounded recall fallback."""
 
     return filter_bilibili_candidates(
         (*primary, *fallback),
         limit=SEARCH_LIMIT,
+        max_duration_ms=max_duration_ms,
+    )
+
+
+def _is_within_duration_limit(
+    duration_ms: int,
+    max_duration_ms: int | None,
+) -> bool:
+    return duration_ms > 0 and (
+        max_duration_ms is None or duration_ms <= max_duration_ms
     )
 
 
@@ -391,6 +447,27 @@ def _display_stem(candidate: BilibiliCandidate) -> str:
 def _duration_text(duration_ms: int) -> str:
     seconds = max(0, duration_ms) // 1000
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _duration_exceeds_limit(
+    duration_ms: int | None,
+    limits: MediaLimits,
+) -> bool:
+    return bool(
+        duration_ms
+        and limits.max_duration_ms is not None
+        and duration_ms > limits.max_duration_ms
+    )
+
+
+def _delivery_duration_error(limits: MediaLimits) -> str:
+    """Describe the only duration limit users can encounter: voice delivery."""
+
+    assert limits.max_duration_ms is not None
+    minutes = limits.max_duration_ms // 60_000
+    if limits.max_duration_ms == VOICE_MEDIA_LIMITS.max_duration_ms:
+        return f"歌曲时长超过 {minutes} 分钟，请回复“序号 下载”发送文件"
+    return f"歌曲时长超过 {minutes} 分钟，无法发送"
 
 
 def _positive_int(value: Any) -> int:

@@ -18,11 +18,12 @@ import shutil
 from typing import Any
 from urllib.parse import urlsplit
 
+import aiohttp
+
 from .models import LocalMedia, ResolvedAudio
 
 
-MAX_MEDIA_BYTES = 25 * 1024 * 1024
-MAX_MEDIA_DURATION_MS = 15 * 60 * 1000
+_MEBIBYTE = 1024 * 1024
 
 
 class MediaError(RuntimeError):
@@ -34,7 +35,7 @@ class MediaDownloadError(MediaError):
 
 
 class MediaTooLargeError(MediaError):
-    """The provider stream exceeded the fixed delivery size limit."""
+    """The provider stream exceeded the selected delivery size limit."""
 
 
 class FfmpegUnavailableError(MediaError):
@@ -43,6 +44,35 @@ class FfmpegUnavailableError(MediaError):
 
 class MediaRemuxError(MediaError):
     """ffmpeg could not place a DASH stream into an M4A container."""
+
+
+@dataclass(frozen=True, slots=True)
+class MediaLimits:
+    """One delivery mode's bounded network-download and local-media budget."""
+
+    max_bytes: int
+    max_duration_ms: int | None
+    download_timeout_seconds: float
+
+    def __post_init__(self) -> None:
+        if self.max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
+        if self.max_duration_ms is not None and self.max_duration_ms < 1:
+            raise ValueError("max_duration_ms must be positive or None")
+        if self.download_timeout_seconds <= 0:
+            raise ValueError("download_timeout_seconds must be positive")
+
+
+VOICE_MEDIA_LIMITS = MediaLimits(
+    max_bytes=25 * _MEBIBYTE,
+    max_duration_ms=15 * 60 * 1000,
+    download_timeout_seconds=180.0,
+)
+DOWNLOAD_MEDIA_LIMITS = MediaLimits(
+    max_bytes=100 * _MEBIBYTE,
+    max_duration_ms=None,
+    download_timeout_seconds=900.0,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,18 +120,14 @@ class MediaStore:
         session: Any,
         media_dir: str | Path,
         *,
-        max_bytes: int = MAX_MEDIA_BYTES,
         max_concurrent_deliveries: int = 2,
         ffmpeg_binary: str = "ffmpeg",
     ) -> None:
-        if max_bytes < 1:
-            raise ValueError("max_bytes must be positive")
         if max_concurrent_deliveries < 1:
             raise ValueError("max_concurrent_deliveries must be positive")
 
         self._session = session
         self._media_dir = Path(media_dir)
-        self._max_bytes = max_bytes
         self._delivery_slots = asyncio.Semaphore(max_concurrent_deliveries)
         self._state_lock = asyncio.Lock()
         self._preparations: set[asyncio.Task[Any]] = set()
@@ -145,11 +171,17 @@ class MediaStore:
             async with self._state_lock:
                 self._reclaiming_stale = False
 
-    async def prepare(self, audio: ResolvedAudio, *, filename_stem: str) -> LocalMedia:
+    async def prepare(
+        self,
+        audio: ResolvedAudio,
+        *,
+        filename_stem: str,
+        limits: MediaLimits = VOICE_MEDIA_LIMITS,
+    ) -> LocalMedia:
         """Materialize ``audio`` as a unique, bounded temporary file."""
 
-        if audio.duration_ms and audio.duration_ms > MAX_MEDIA_DURATION_MS:
-            raise MediaError("歌曲时长超过 15 分钟，无法发送")
+        if _duration_exceeds_limit(audio.duration_ms, limits):
+            raise MediaError(_duration_limit_message(limits))
         if not self._ffmpeg_path:
             raise FfmpegUnavailableError("宿主机未安装 ffmpeg，暂时无法听歌或下载歌曲")
 
@@ -164,7 +196,16 @@ class MediaStore:
             await self._delivery_slots.acquire()
             lease = _DeliveryLease()
             await self._ensure_open()
-            downloaded = await self._download_with_backups(audio, token)
+            try:
+                # One delivery gets one network budget.  Backup CDN URLs are
+                # alternate paths for the same stream, not fresh 15-minute
+                # attempts that may extend a queued delivery without bound.
+                downloaded = await asyncio.wait_for(
+                    self._download_with_backups(audio, token, limits=limits),
+                    timeout=limits.download_timeout_seconds,
+                )
+            except asyncio.TimeoutError as exc:
+                raise MediaDownloadError("音源下载超时") from exc
             if audio.needs_remux:
                 output_path = await self._remux_to_m4a(downloaded.path, token)
                 mime_type = "audio/mp4"
@@ -174,8 +215,8 @@ class MediaStore:
                 downloaded = None
 
             size_bytes = output_path.stat().st_size
-            if size_bytes > self._max_bytes:
-                raise MediaTooLargeError("音频文件超过 25 MiB 限制")
+            if size_bytes > limits.max_bytes:
+                raise _too_large_error(limits)
 
             media = LocalMedia(
                 path=output_path,
@@ -291,7 +332,11 @@ class MediaStore:
             raise MediaError("媒体服务已关闭")
 
     async def _download_with_backups(
-        self, audio: ResolvedAudio, token: str
+        self,
+        audio: ResolvedAudio,
+        token: str,
+        *,
+        limits: MediaLimits,
     ) -> _DownloadedFile:
         last_error: Exception | None = None
         for index, url in enumerate((audio.url, *audio.backup_urls)):
@@ -301,6 +346,7 @@ class MediaStore:
                     headers=audio.headers,
                     fallback_mime=audio.mime_type,
                     token=f"{token}-{index}",
+                    limits=limits,
                 )
                 if not _is_audio_mime(
                     downloaded.mime_type, allow_video=audio.needs_remux
@@ -323,6 +369,7 @@ class MediaStore:
         headers: Mapping[str, str],
         fallback_mime: str | None,
         token: str,
+        limits: MediaLimits,
     ) -> _DownloadedFile:
         parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -337,14 +384,19 @@ class MediaStore:
                 url,
                 headers=dict(headers),
                 allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(
+                    connect=15,
+                    sock_read=120,
+                    total=limits.download_timeout_seconds,
+                ),
             ) as response:
                 status = int(getattr(response, "status", 0))
                 if status < 200 or status >= 300:
                     raise MediaDownloadError(f"音源请求失败（HTTP {status}）")
                 response_headers = getattr(response, "headers", {})
                 content_length = _content_length(response_headers)
-                if content_length is not None and content_length > self._max_bytes:
-                    raise MediaTooLargeError("音频文件超过 25 MiB 限制")
+                if content_length is not None and content_length > limits.max_bytes:
+                    raise _too_large_error(limits)
 
                 size_bytes = 0
                 with part_path.open("wb") as target:
@@ -352,8 +404,8 @@ class MediaStore:
                         if not chunk:
                             continue
                         size_bytes += len(chunk)
-                        if size_bytes > self._max_bytes:
-                            raise MediaTooLargeError("音频文件超过 25 MiB 限制")
+                        if size_bytes > limits.max_bytes:
+                            raise _too_large_error(limits)
                         target.write(chunk)
         except asyncio.CancelledError:
             _unlink_quietly(part_path)
@@ -447,6 +499,40 @@ def _content_length(headers: Any) -> int | None:
     return value if value >= 0 else None
 
 
+def _duration_exceeds_limit(duration_ms: int | None, limits: MediaLimits) -> bool:
+    return (
+        duration_ms is not None
+        and limits.max_duration_ms is not None
+        and duration_ms > limits.max_duration_ms
+    )
+
+
+def _duration_limit_message(limits: MediaLimits) -> str:
+    assert limits.max_duration_ms is not None
+    duration_ms = limits.max_duration_ms
+    if duration_ms % 60_000 == 0:
+        limit_text = f"{duration_ms // 60_000} 分钟"
+    elif duration_ms % 1_000 == 0:
+        limit_text = f"{duration_ms // 1_000} 秒"
+    else:
+        limit_text = f"{duration_ms} 毫秒"
+    return f"音频时长超过 {limit_text} 限制"
+
+
+def _too_large_error(limits: MediaLimits) -> MediaTooLargeError:
+    return MediaTooLargeError(
+        f"音频文件超过 {_format_byte_limit(limits.max_bytes)} 限制"
+    )
+
+
+def _format_byte_limit(max_bytes: int) -> str:
+    if max_bytes % _MEBIBYTE == 0:
+        return f"{max_bytes // _MEBIBYTE} MiB"
+    if max_bytes % 1024 == 0:
+        return f"{max_bytes // 1024} KiB"
+    return f"{max_bytes} B"
+
+
 def _media_mime(headers: Any, fallback: str | None) -> str:
     raw = ""
     try:
@@ -504,13 +590,14 @@ def _unlink_quietly(path: Path) -> None:
 
 
 __all__ = [
+    "DOWNLOAD_MEDIA_LIMITS",
     "FfmpegUnavailableError",
-    "MAX_MEDIA_BYTES",
-    "MAX_MEDIA_DURATION_MS",
     "MediaDownloadError",
     "MediaError",
     "MediaHealth",
+    "MediaLimits",
     "MediaRemuxError",
     "MediaStore",
     "MediaTooLargeError",
+    "VOICE_MEDIA_LIMITS",
 ]

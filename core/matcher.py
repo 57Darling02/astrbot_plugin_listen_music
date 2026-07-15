@@ -15,21 +15,18 @@ import unicodedata
 from .models import BilibiliCandidate
 
 
-MAX_DELIVERABLE_DURATION_MS = 15 * 60 * 1000
-"""The largest page duration the delivery layer is willing to materialize."""
-
-
 def filter_bilibili_candidates(
     candidates: Iterable[BilibiliCandidate],
     *,
     limit: int = 5,
+    max_duration_ms: int | None = None,
 ) -> tuple[BilibiliCandidate, ...]:
     """Return unique, deliverable pages in their original platform order.
 
     The filter deliberately does not interpret titles or categories.  Version
     preference is conversational context that the LLM can evaluate with the
-    complete candidate list; local code only rejects pages that cannot be
-    delivered under the fixed duration boundary.
+    complete candidate list; local code only rejects invalid durations and an
+    optional caller-owned duration boundary.
     """
 
     if limit < 1:
@@ -41,7 +38,7 @@ def filter_bilibili_candidates(
         if candidate.candidate_id in seen_ids:
             continue
         seen_ids.add(candidate.candidate_id)
-        if not _has_deliverable_duration(candidate.duration_ms):
+        if not _has_deliverable_duration(candidate.duration_ms, max_duration_ms):
             continue
         accepted.append(candidate)
         if len(accepted) >= limit:
@@ -60,8 +57,10 @@ def prepare_bilibili_search_query(query: str) -> str:
     return _clean_bilibili_search_terms(query)
 
 
-def _has_deliverable_duration(duration_ms: int) -> bool:
-    return 0 < duration_ms <= MAX_DELIVERABLE_DURATION_MS
+def _has_deliverable_duration(duration_ms: int, max_duration_ms: int | None) -> bool:
+    return duration_ms > 0 and (
+        max_duration_ms is None or duration_ms <= max_duration_ms
+    )
 
 
 def _strip_query_noise(query: str) -> str:

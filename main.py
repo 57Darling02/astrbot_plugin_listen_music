@@ -40,7 +40,14 @@ from .core.accounts import (
     QrLoginStart,
 )
 from .core.bilibili import BilibiliClient, parse_bilibili_video_ref
-from .core.media import FfmpegUnavailableError, MediaError, MediaStore
+from .core.media import (
+    DOWNLOAD_MEDIA_LIMITS,
+    VOICE_MEDIA_LIMITS,
+    FfmpegUnavailableError,
+    MediaError,
+    MediaLimits,
+    MediaStore,
+)
 from .core.models import BilibiliCandidate, SearchSnapshot
 from .core.selection import SearchSnapshotStore
 from .core.services import (
@@ -116,6 +123,16 @@ class _DeliveryMode(str, Enum):
 
     VOICE = "voice"
     DOWNLOAD = "download"
+
+
+def _media_limits_for(action: _DeliveryMode) -> MediaLimits:
+    """Keep user-visible delivery intent aligned with one media budget."""
+
+    return (
+        DOWNLOAD_MEDIA_LIMITS
+        if action is _DeliveryMode.DOWNLOAD
+        else VOICE_MEDIA_LIMITS
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -602,6 +619,7 @@ class ListenMusicPlugin(Star):
                 session_id=session_id,
                 query=music.query,
                 song_title=music.title,
+                max_duration_ms=VOICE_MEDIA_LIMITS.max_duration_ms,
             )
             if not self._complete_llm_search(session_id, lease, snapshot):
                 return _tool_error("歌曲请求已被新的消息替换")
@@ -703,7 +721,10 @@ class ListenMusicPlugin(Star):
         """Overlap a user-visible preface with preparation of the selected media."""
 
         preparation = asyncio.create_task(
-            self._require_delivery().deliver(candidate),
+            self._require_delivery().deliver(
+                candidate,
+                limits=_media_limits_for(action),
+            ),
             name=f"listen-music-delivery-{candidate.candidate_id}",
         )
         handed_to_sender = False
@@ -814,6 +835,7 @@ class ListenMusicPlugin(Star):
     ) -> None:
         """Resolve the next real user reply against its original snapshot."""
 
+        stop_wait = True
         try:
             if " ".join(reply.message_str.split()) == "取消":
                 await reply.send(reply.plain_result("已取消选歌。"))
@@ -831,7 +853,19 @@ class ListenMusicPlugin(Star):
             if candidate is None:
                 await reply.send(reply.plain_result("搜索结果已过期，请重新搜索。"))
                 return
-            result = await self._require_delivery().deliver(candidate)
+            if _selection_requires_download(candidate, action):
+                await reply.send(
+                    reply.plain_result(
+                        f"第 {position} 首时长超过 15 分钟，仅可下载；"
+                        f"请回复“{position} 下载”。"
+                    )
+                )
+                stop_wait = False
+                return
+            result = await self._require_delivery().deliver(
+                candidate,
+                limits=_media_limits_for(action),
+            )
             await self._send_delivery(reply, result, action)
         except (DeliveryError, FfmpegUnavailableError, MediaError) as exc:
             await reply.send(reply.plain_result(str(exc)))
@@ -839,7 +873,8 @@ class ListenMusicPlugin(Star):
             logger.exception("listen-music interactive delivery failed")
             await reply.send(reply.plain_result("歌曲发送失败，请稍后重试。"))
         finally:
-            controller.stop()
+            if stop_wait:
+                controller.stop()
 
     async def _cancel_selection_wait(self, session_id: str) -> None:
         """Stop a just-created waiter when its result list could not be sent."""
@@ -1184,6 +1219,19 @@ def _is_selection_reply(message: str) -> bool:
 
 def _selection_mode_from_word(word: str) -> _DeliveryMode:
     return _DeliveryMode.DOWNLOAD if word == "下载" else _DeliveryMode.VOICE
+
+
+def _selection_requires_download(
+    candidate: BilibiliCandidate,
+    action: _DeliveryMode,
+) -> bool:
+    """Keep a long manual candidate available for its immediate file retry."""
+
+    return bool(
+        action is _DeliveryMode.VOICE
+        and VOICE_MEDIA_LIMITS.max_duration_ms is not None
+        and candidate.duration_ms > VOICE_MEDIA_LIMITS.max_duration_ms
+    )
 
 
 def _delivery_preface(
