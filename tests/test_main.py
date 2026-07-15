@@ -135,6 +135,9 @@ def _install_astrbot_doubles() -> None:
         def info(self, *_args, **_kwargs):
             pass
 
+        def warning(self, *_args, **_kwargs):
+            pass
+
         def exception(self, *_args, **_kwargs):
             pass
 
@@ -197,11 +200,21 @@ listen_main = importlib.import_module("astrbot_plugin_listen_music.main")
 
 
 class _Event(listen_main.AstrMessageEvent):
-    def __init__(self, session_id: str, message: str = "") -> None:
+    def __init__(
+        self,
+        session_id: str,
+        message: str = "",
+        *,
+        platform_name: str = "test",
+    ) -> None:
         self.unified_msg_origin = session_id
         self.message_str = message
+        self._platform_name = platform_name
         self.call_llm = False
         self.stopped = False
+
+    def get_platform_name(self) -> str:
+        return self._platform_name
 
     def should_call_llm(self, value: bool) -> None:
         self.call_llm = value
@@ -213,8 +226,14 @@ class _Event(listen_main.AstrMessageEvent):
 class _SendingEvent(_Event):
     """Event double that records exact user-visible delivery order."""
 
-    def __init__(self, session_id: str, message: str = "") -> None:
-        super().__init__(session_id, message)
+    def __init__(
+        self,
+        session_id: str,
+        message: str = "",
+        *,
+        platform_name: str = "test",
+    ) -> None:
+        super().__init__(session_id, message, platform_name=platform_name)
         self.sent: list[object] = []
 
     def plain_result(self, text: str) -> tuple[str, str]:
@@ -1099,7 +1118,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(released, [media])
 
-    async def test_send_delivery_releases_media_when_component_construction_fails(
+    async def test_send_delivery_falls_back_to_file_when_voice_component_fails(
         self,
     ) -> None:
         released: list[object] = []
@@ -1113,7 +1132,7 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         )
         plugin = object.__new__(listen_main.ListenMusicPlugin)
         plugin._media = FakeMedia()
-        event = _Event("chat-a")
+        event = _SendingEvent("chat-a")
         result = types.SimpleNamespace(media=media_result)
         original = listen_main.Record.fromFileSystem
 
@@ -1122,13 +1141,76 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
 
         listen_main.Record.fromFileSystem = staticmethod(fail_component_construction)
         try:
-            with self.assertRaisesRegex(RuntimeError, "component failed"):
-                await plugin._send_delivery(
-                    event, result, listen_main._DeliveryMode.VOICE
-                )
+            await plugin._send_delivery(event, result, listen_main._DeliveryMode.VOICE)
         finally:
             listen_main.Record.fromFileSystem = staticmethod(original)
+
         self.assertEqual(released, [media_result])
+        self.assertEqual(len(event.sent), 1)
+        component = event.sent[0][0]
+        self.assertIsInstance(component, listen_main.File)
+        self.assertEqual(
+            component.kwargs,
+            {"name": "fixture.m4a", "file": "/tmp/fixture.m4a"},
+        )
+
+    async def test_weixin_oc_voice_delivery_uses_file_without_trying_record(
+        self,
+    ) -> None:
+        released: list[object] = []
+
+        class FakeMedia:
+            async def release(self, media):
+                released.append(media)
+
+        media_result = types.SimpleNamespace(
+            path=Path("/tmp/fixture.m4a"), filename="fixture.m4a"
+        )
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._media = FakeMedia()
+        event = _SendingEvent("chat-a", platform_name="weixin_oc")
+        result = types.SimpleNamespace(media=media_result)
+        original = listen_main.Record.fromFileSystem
+
+        def record_must_not_be_created(_path):
+            raise AssertionError("weixin_oc must use a file directly")
+
+        listen_main.Record.fromFileSystem = staticmethod(record_must_not_be_created)
+        try:
+            await plugin._send_delivery(event, result, listen_main._DeliveryMode.VOICE)
+        finally:
+            listen_main.Record.fromFileSystem = staticmethod(original)
+
+        self.assertEqual(released, [media_result])
+        self.assertEqual(len(event.sent), 1)
+        self.assertIsInstance(event.sent[0][0], listen_main.File)
+
+    async def test_send_delivery_retries_file_when_voice_send_is_rejected(self) -> None:
+        released: list[object] = []
+
+        class FakeMedia:
+            async def release(self, media):
+                released.append(media)
+
+        class RecordRejectingEvent(_SendingEvent):
+            async def send(self, message: object) -> None:
+                if isinstance(message[0], tuple) and message[0][0] == "record":
+                    raise RuntimeError("record unsupported")
+                await super().send(message)
+
+        media_result = types.SimpleNamespace(
+            path=Path("/tmp/fixture.m4a"), filename="fixture.m4a"
+        )
+        plugin = object.__new__(listen_main.ListenMusicPlugin)
+        plugin._media = FakeMedia()
+        event = RecordRejectingEvent("chat-a")
+        result = types.SimpleNamespace(media=media_result)
+
+        await plugin._send_delivery(event, result, listen_main._DeliveryMode.VOICE)
+
+        self.assertEqual(released, [media_result])
+        self.assertEqual(len(event.sent), 1)
+        self.assertIsInstance(event.sent[0][0], listen_main.File)
 
     def test_selection_parser_and_filter_share_one_grammar(self) -> None:
         expected = listen_main._DeliveryMode

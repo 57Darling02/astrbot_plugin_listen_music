@@ -60,6 +60,8 @@ INTERACTION_TIMEOUT_SECONDS = 90
 SEARCH_SNAPSHOT_TTL_SECONDS = 300.0
 SEARCH_SNAPSHOT_MAX_ENTRIES = 1024
 MAX_DELIVERY_NOTE_LENGTH = 120
+# AstrBot's weixin_oc adapter accepts File outbound but ignores Record.
+_VOICE_AS_FILE_PLATFORMS = frozenset({"weixin_oc"})
 _CANONICAL_RECORDING_PREFERENCES = frozenset({"原版", "原唱", "original"})
 _CHINESE_SELECTION_POSITIONS = tuple("一二三四五六七八九十")
 if SEARCH_LIMIT > len(_CHINESE_SELECTION_POSITIONS):
@@ -955,12 +957,22 @@ class ListenMusicPlugin(Star):
     ) -> None:
         media = self._require_media()
         try:
-            if action is _DeliveryMode.VOICE:
-                component = Record.fromFileSystem(result.media.path)
-            else:
-                component = File(
-                    name=result.media.filename, file=str(result.media.path)
-                )
+            platform_name = event.get_platform_name()
+            if (
+                action is _DeliveryMode.VOICE
+                and platform_name not in _VOICE_AS_FILE_PLATFORMS
+            ):
+                try:
+                    component = Record.fromFileSystem(result.media.path)
+                    await event.send(MessageChain([component]))
+                    return
+                except Exception:
+                    logger.warning(
+                        "listen-music voice delivery failed on %s; falling back to file",
+                        platform_name,
+                    )
+
+            component = File(name=result.media.filename, file=str(result.media.path))
             await event.send(MessageChain([component]))
         finally:
             await media.release(result.media)
