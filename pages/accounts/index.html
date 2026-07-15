@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>我想听歌！- 音乐账号</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="page-shell">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">我想听歌！</p>
+          <h1>音乐账号</h1>
+        </div>
+        <button class="secondary-button" id="refresh" type="button">刷新状态</button>
+      </header>
+
+      <p class="page-message" id="page-message" role="status" hidden></p>
+
+      <section class="account-section" aria-label="Bilibili 账号">
+        <article class="account-card">
+          <div class="account-heading">
+            <div>
+              <p class="platform-label">音乐账号</p>
+              <h2>Bilibili</h2>
+            </div>
+            <span class="status-badge" data-role="state">加载中</span>
+          </div>
+          <p class="account-name" data-role="name">未登录</p>
+          <div class="account-actions">
+            <button class="primary-button" data-action="login" type="button">扫码登录</button>
+            <button class="danger-button" data-action="logout" type="button" hidden>退出登录</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="runtime-status" aria-labelledby="runtime-heading">
+        <div>
+          <p class="platform-label">运行状态</p>
+          <h2 id="runtime-heading">媒体处理</h2>
+        </div>
+        <p id="ffmpeg-status">加载中</p>
+      </section>
+    </main>
+
+    <dialog id="login-dialog" aria-labelledby="login-title">
+      <form method="dialog" class="dialog-shell">
+        <header class="dialog-header">
+          <div>
+            <p class="platform-label">Bilibili</p>
+            <h2 id="login-title">扫码登录</h2>
+          </div>
+          <button class="icon-button" id="close-login" type="button" aria-label="关闭" title="关闭">×</button>
+        </header>
+        <div class="qr-stage" id="qr-stage">
+          <img id="qr-code" alt="登录二维码" hidden />
+          <p id="login-state" role="status">正在生成二维码</p>
+        </div>
+        <button class="secondary-button dialog-cancel" id="cancel-login" type="button">取消</button>
+      </form>
+    </dialog>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

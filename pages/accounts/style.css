@@ -1,0 +1,330 @@
+:root {
+  --canvas: #f6f7f8;
+  --surface: #ffffff;
+  --ink: #202428;
+  --muted: #667078;
+  --line: #d8dde0;
+  --accent: #007c73;
+  --accent-strong: #00665f;
+  --danger: #b42318;
+  --danger-surface: #fff4f2;
+  --warning: #9a6700;
+  --warning-surface: #fff8db;
+  --success: #087443;
+  --success-surface: #eaf8ef;
+  --focus: #1669c9;
+}
+
+[data-theme="dark"] {
+  --canvas: #171b1e;
+  --surface: #22282c;
+  --ink: #eef2f3;
+  --muted: #acb7bc;
+  --line: #3d484e;
+  --accent: #5bd1c4;
+  --accent-strong: #7de1d6;
+  --danger: #ff9a8e;
+  --danger-surface: #422321;
+  --warning: #f6ca69;
+  --warning-surface: #403616;
+  --success: #83dbad;
+  --success-surface: #1d3b2d;
+  --focus: #8bbcff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 0;
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.45;
+}
+
+button {
+  min-height: 34px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: 0;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+button:disabled {
+  cursor: progress;
+  opacity: 0.58;
+}
+
+.page-shell {
+  width: min(100%, 900px);
+  margin: 0 auto;
+  padding: 28px 24px 40px;
+}
+
+.page-header {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 18px;
+}
+
+.eyebrow,
+.platform-label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.eyebrow {
+  color: var(--accent);
+}
+
+h1,
+h2,
+p {
+  overflow-wrap: anywhere;
+}
+
+h1,
+h2 {
+  margin: 0;
+  color: var(--ink);
+  letter-spacing: 0;
+}
+
+h1 {
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+h2 {
+  font-size: 17px;
+  line-height: 1.3;
+}
+
+.secondary-button,
+.primary-button,
+.danger-button {
+  padding: 6px 12px;
+  white-space: nowrap;
+}
+
+.secondary-button {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.secondary-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.primary-button {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.primary-button:hover:not(:disabled) {
+  background: var(--accent-strong);
+}
+
+.danger-button {
+  background: var(--danger-surface);
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.page-message {
+  margin: 18px 0 0;
+  border-left: 3px solid var(--danger);
+  color: var(--danger);
+  padding: 8px 10px;
+}
+
+.page-message[data-tone="success"] {
+  border-color: var(--success);
+  color: var(--success);
+}
+
+.account-section {
+  margin-top: 24px;
+}
+
+.account-card {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  min-width: 0;
+  min-height: 180px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 18px;
+}
+
+.account-heading,
+.account-actions,
+.runtime-status,
+.dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.status-badge {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--warning-surface);
+  color: var(--warning);
+  padding: 3px 8px;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.status-badge[data-state="connected"],
+.status-badge[data-state="confirmed"] {
+  background: var(--success-surface);
+  color: var(--success);
+}
+
+.status-badge[data-state="failed"],
+.status-badge[data-state="expired"] {
+  background: var(--danger-surface);
+  color: var(--danger);
+}
+
+.account-name {
+  align-self: center;
+  margin: 18px 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.account-actions {
+  justify-content: flex-start;
+}
+
+.runtime-status {
+  margin-top: 18px;
+  border-top: 1px solid var(--line);
+  padding: 18px 0 0;
+}
+
+.runtime-status > p {
+  margin: 0;
+  color: var(--muted);
+  text-align: right;
+}
+
+.runtime-status > p[data-state="ready"] {
+  color: var(--success);
+}
+
+.runtime-status > p[data-state="missing"] {
+  color: var(--danger);
+}
+
+dialog {
+  width: min(calc(100% - 32px), 380px);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0;
+  box-shadow: 0 18px 60px rgb(0 0 0 / 24%);
+}
+
+dialog::backdrop {
+  background: rgb(0 0 0 / 45%);
+}
+
+.dialog-shell {
+  margin: 0;
+  padding: 18px;
+}
+
+.dialog-header {
+  align-items: flex-start;
+}
+
+.icon-button {
+  display: grid;
+  width: 34px;
+  min-width: 34px;
+  place-items: center;
+  background: transparent;
+  border-color: var(--line);
+  color: var(--ink);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.qr-stage {
+  display: grid;
+  min-height: 270px;
+  place-items: center;
+  margin: 18px 0;
+  border: 1px solid var(--line);
+  background: var(--canvas);
+  padding: 14px;
+}
+
+.qr-stage img {
+  display: block;
+  width: min(100%, 230px);
+  aspect-ratio: 1;
+  background: #ffffff;
+  image-rendering: pixelated;
+}
+
+.qr-stage p {
+  margin: 0;
+  color: var(--muted);
+  text-align: center;
+}
+
+.qr-stage p[data-state="scanned"] {
+  color: var(--warning);
+}
+
+.qr-stage p[data-state="failed"],
+.qr-stage p[data-state="expired"] {
+  color: var(--danger);
+}
+
+.qr-stage p[data-state="confirmed"] {
+  color: var(--success);
+}
+
+.dialog-cancel {
+  width: 100%;
+}
+
+@media (max-width: 620px) {
+  .page-shell {
+    padding: 20px 16px 32px;
+  }
+
+  .page-header {
+    align-items: flex-start;
+  }
+
+  .account-card {
+    min-height: 156px;
+  }
+}
