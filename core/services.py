@@ -322,7 +322,13 @@ def format_search_results(snapshot: SearchSnapshot) -> str:
             f"{position}. {candidate.display_title} "
             f"({_duration_text(candidate.duration_ms)}{download_only})"
         )
-    lines.append("回复序号听歌；回复“序号 下载”发送文件。")
+    lines.extend(
+        (
+            "听歌：回复“序号”",
+            "下载：回复“序号 下载”",
+        )
+    )
+
     return "\n".join(lines)
 
 

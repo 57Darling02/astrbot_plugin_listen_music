@@ -489,6 +489,8 @@ class BilibiliWorkflowTests(unittest.IsolatedAsyncioTestCase):
         rendered_for_user = format_search_results(snapshot)
         self.assertIn("详情页标题 - P2 歌曲页 (4:29)", rendered_for_user)
         self.assertNotIn("UP主", rendered_for_user)
+        self.assertIn("听歌：回复“序号”", rendered_for_user)
+        self.assertIn("下载：回复“序号 下载”", rendered_for_user)
         self.assertEqual(
             set(summary[0].__dataclass_fields__),
             {"position", "title", "duration", "search_title", "page_title"},

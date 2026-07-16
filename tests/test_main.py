@@ -307,6 +307,9 @@ class MainContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(find_tool.parameters["required"], ["title"])
         self.assertIn("唱首歌", find_tool.description)
+        self.assertIn("歌名精确或完整匹配优先", find_tool.description)
+        self.assertIn("版本偏好", find_tool.description)
+        self.assertIn("不要猜测或发送", find_tool.description)
 
         self.assertEqual(deliver_tool.name, "deliver_music")
         self.assertEqual(

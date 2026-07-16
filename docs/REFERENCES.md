@@ -14,10 +14,10 @@ NeriPlayer 是历史设计参考，帮助本项目厘清视频与具体分 P 的
 
 建议开发者阅读：
 
-- [SearchManager.kt](https://github.com/cwuom/NeriPlayer/blob/e76bc4f21e010f67c05f9e6c9f846ec958b7985f/app/src/main/java/moe/ouom/neriplayer/core/api/search/SearchManager.kt)：了解标题、艺人和时长如何作为候选判断证据；本项目不复制其评分公式或阈值。
+- [SearchManager.kt](https://github.com/cwuom/NeriPlayer/blob/e76bc4f21e010f67c05f9e6c9f846ec958b7985f/app/src/main/java/moe/ouom/neriplayer/core/api/search/SearchManager.kt)：了解歌名优先、艺人佐证与可信度拒绝的候选判断思路；本项目不复制其评分公式、权重或阈值。
 - [PlayerManagerNeteaseAutoSourceSwitch.kt](https://github.com/cwuom/NeriPlayer/blob/e76bc4f21e010f67c05f9e6c9f846ec958b7985f/app/src/main/java/moe/ouom/neriplayer/core/player/resolver/netease/PlayerManagerNeteaseAutoSourceSwitch.kt)：理解视频结果展开为具体分 P 与固定媒体身份的必要性；不是本项目评分、阈值或自动切源的蓝图。
 
-不要迁移：NeriPlayer 的多平台播放器、Android 生命周期、音质偏好链、网易云自动切源、YouTube 代码及其 Kotlin 实现。本项目不复制数值评分或分数阈值：语义上的候选判断由 LLM 在插件提供的受限候选集内完成，插件仍负责页身份与交付安全。
+不要迁移：NeriPlayer 的多平台播放器、Android 生命周期、音质偏好链、网易云自动切源、YouTube 代码及其 Kotlin 实现。本项目不复制数值评分、权重或分数阈值：LLM 只借鉴歌名优先、艺人佐证、版本尊重与低可信拒绝的定性证据顺序，在插件提供的受限候选集内完成语义判断；插件仍负责页身份与交付安全。
 
 ## astrbot_plugin_music：AstrBot 集成
 
